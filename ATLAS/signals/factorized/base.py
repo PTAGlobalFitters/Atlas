@@ -14,6 +14,9 @@ import random
 from sklearn.decomposition import PCA
 from functools import cached_property
 
+# Dispersion delays scale as f^-2: the chromatic index a `dm` block is built with.
+DM_CHROM_INDEX = 2.0
+
 class Red:
     """Per-pulsar red-noise signal on a Fourier (sine/cosine) basis.
 
@@ -775,6 +778,10 @@ class SuperSignal:
         ``has_gtm`` / ``has_det`` mirror its keys.
     get_Fmat_concat : array, [n_toas, nmodes]
         The assembled T-matrix, ``[timing | shared block | separate blocks]``.
+        A ``dm`` block carries the DM chromatic index: each TOA's row is
+        scaled by ``(f_ref / f_radio)**DM_CHROM_INDEX``.
+    chrom_idxs : slice or None
+        Column slice of the ``dm`` block, or None without one.
     signal_comb_idxs : dict[str, slice]
         Column slice of each signal (plus ``'timing'``) within that matrix.
     nmodes : int
@@ -848,7 +855,9 @@ class SuperSignal:
         self.get_Fmat_concat, self.signal_comb_idxs = self.build_basis(self.signal_combination_string, self.signal_map)
         self.chrom_idxs = self.signal_comb_idxs['dm'] if 'dm' in self.signal_comb_idxs.keys() else None
         if self.chrom_idxs is not None:
-            self.get_Fmat_concat = self.update_red_basis(chrom_index = jnp.ones(self.data.npsrs) * 2)
+            # build_basis returns the dm block achromatic; give it the DM index.
+            self.get_Fmat_concat = self._scale_chromatic(
+                self.get_Fmat_concat, jnp.ones(self.data.npsrs) * DM_CHROM_INDEX)
 
         # Total column count of the assembled T-matrix: timing + every Fourier
         # block + any deterministic block.  NOT 2*nfreqs of a single signal.
@@ -878,22 +887,34 @@ class SuperSignal:
 
         self.model_maker()
         
-    @jit_method     
-    def update_red_basis(self, chrom_index):
-        """        
-        Update the red noise basis using a
-        chromatic index per pulsar. 
+    @jit_method
+    def update_red_basis(self, chrom_index, red_noise_basis=None):
+        """
+        Return the red noise basis with the dm block's chromatic index set
+        per pulsar.
 
         Args:
             chrom_index: The chromatic index per pulsar.
             The shape of the array must be (npsrs)
+            red_noise_basis: The T-matrix to rescale; defaults to
+            ``get_Fmat_concat``.  Its dm block must carry the DM index, as
+            ``get_Fmat_concat``'s does, so pass the basis as built rather
+            than the output of an earlier call.
 
         Returns:
             the updated red noise basis
         """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        # Relative to the DM index the basis already carries, so no second,
+        # achromatic copy of the dm block has to be stored or traced.
+        return self._scale_chromatic(red_noise_basis, chrom_index - DM_CHROM_INDEX)
+
+    def _scale_chromatic(self, basis, chrom_index):
+        """Scale each TOA's row of the dm block by ``(f_ref / f_radio)**chrom_index``."""
         index = chrom_index[self.data.dm_exploder_idxs]
         DM = self.data.ref_over_radio_freqs ** index
-        return self.get_Fmat_concat.at[:, self.chrom_idxs].multiply(DM[:, None])
+        return basis.at[:, self.chrom_idxs].multiply(DM[:, None])
 
     def padd_tm_design_matrix(self):
         """        
