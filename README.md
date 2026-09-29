@@ -346,6 +346,12 @@ with the regression harness:
 | `ltm-dm` | `ltm\|unc+cor->unc;dm` | 24 |
 | `ltm-gtm` | `ltm\|unc+cor->unc;gtm` | 26 |
 | `ltm-dm-gtm` | `ltm\|unc+cor->unc;dm,gtm` | 32 |
+| `curn-margtm-det` | `unc+cor->unc;det`, `marg_timing=True` | 24 |
+| `ltm-det` | `ltm\|unc+cor->unc;det` | 30 |
+
+The two `det` cases carry one continuous-wave source on 6 Fourier bins. Its 12
+columns take no prior and are not whitened, so `z` is 12 columns narrower, and
+every likelihood call passes `D_params`.
 
 `tools/regress.py` compares two git revisions' log-densities and gradients
 elementwise, and is intended as a gate before refactoring.
@@ -373,27 +379,13 @@ The rows above account for 14,930 lines; the package is 16,561 across 34 modules
 
 ## Known issues
 
-- A `det` block works with `marg_timing=True` but crashes with sampled linear
-  timing, before evaluating anything: `model_maker` sizes the reparameterised
-  block as `nmodes - det_signal.num_coeff_det`, while `lnposterior_reparam`
-  still shapes the linear-timing prior from `self.nmodes`. Measured on a
-  3-pulsar synthetic, `"ltm|unc+cor->unc;det"` raises
-  `Incompatible types for broadcasting: float64[12,3] vs float64[28,3]`. A fix
-  is in flight on the `AG` branch.
-- Nothing in the test suite exercises a `det` block — no test mentions
-  `D_params` or `has_det` — which is why the above reached `main`.
 - `ln_likelihood_curn` has no `has_det` guard. With a `det` block it either
   fails on shape or, given a matching-width `phiinv`, marginalises the
   deterministic columns under a red-noise prior and returns an answer.
-- `SuperSignal.nfreqs` (`signals/factorized/base.py:822`) subtracts only the
+- `SuperSignal.nfreqs` (`signals/factorized/base.py`) subtracts only the
   timing width, so deterministic columns are counted as red-noise bins.
 - `cw_delay_evolve_float64` documents its return as `[ns]`
   (`signals/deterministic/det_signals.py:86`); the delays are in **seconds**.
-- An `ltm|` prefix is only honoured when the shared group names a representative
-  with `->`. Without one, `build_basis` leaves `M` out of the basis while the
-  column map still claims it is there, so `"ltm|unc"` and `"ltm|unc;cor"` both
-  produce slices past the end of the basis. Sampled linear timing therefore
-  needs a `->` in the string; `marg_timing=True` is unaffected.
 - `ln_likelihood_curn` is unusable whenever `SuperSignal` selects
   `PerPulsarRedNoise` — that is, on any model with no `cor` block — because the
   two `parameterized` classes disagree over whether `get_phi_mat_CURN` returns
