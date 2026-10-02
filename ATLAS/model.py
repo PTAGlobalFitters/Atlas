@@ -194,6 +194,7 @@ def model_maker(raw_residuals,
                 'psr_dists',
                 data.psr_dists_mean + psr_dists_standard * data.psr_dists_std)
             D_params = (det_params, psr_phases, psr_dists)
+            numpyro.factor('psr_dist_lnprior', det.psr_dists_lnprior(det_params, psr_phases, psr_dists))
     else:
         D_params = None
 

@@ -3,6 +3,8 @@ Holds the class for general deterministic signals.
 """
 
 import jax.numpy as jnp
+from jax.scipy.stats import norm
+from jax import vmap
 import numpy as np
 from scipy.signal.windows import tukey
 
@@ -103,6 +105,29 @@ class Deterministic:
 
         # Tukey window for FFT
         self.Tukey_det = jnp.array(tukey(self.Nsparse, alpha=(Tspan_ext - self.data.pta_tspan) / Tspan_ext))
+
+        # pulsar distances
+        psr_dists_mean = []
+        psr_dists_std = []
+        psr_dists_method = []
+        for psr in self.data.psrs:
+            if psr.name in list(self.data.psr_dists_dict.keys()):
+                dist, std, method = self.data.psr_dists_dict[psr.name]
+                psr_dists_mean.append(dist)
+                psr_dists_std.append(std)
+                psr_dists_method.append(method)
+            else:
+                psr_dists_mean.append(psr.pdist[0])
+                psr_dists_std.append(psr.pdist[1])
+                psr_dists_method.append('other')
+        self.psr_dists_mean = jnp.array(psr_dists_mean)
+        self.psr_dists_std = jnp.array(psr_dists_std)
+        self.psr_dists_method = np.array(psr_dists_method)
+        self.where_PX = jnp.where(self.psr_dists_method == 'PX')[0]
+        self.where_DM = jnp.where(self.psr_dists_method == 'DM')[0]
+        self.where_other = jnp.where(self.psr_dists_method == 'other')[0]
+        self.where_not_other = jnp.ones(self.data.npsrs, dtype=bool)
+        self.where_not_other = self.where_not_other.at[self.where_other].set(False)
 
 
     def get_basis(self):
@@ -208,6 +233,66 @@ class Deterministic:
         det_residuals = [self._get_psr_basis(psr) @ a_det[pidx]
                          for pidx, psr in enumerate(self.data.psrs)]
         return jnp.concat(det_residuals)
+
+
+    def ln_p_PX(self, value, dist, err):
+        """
+        Parallax-based prior on pulsar distance (Arzoumanian+ 2023 Eq. 20)
+        p(d) ∝ N(1/d | 1/dist, err/dist^2) * 1/d^2
+        """
+        pi = 1.0 / dist
+        pi_err = err / dist**2
+        inv_value = 1.0 / value
+        z = (inv_value - pi) / pi_err
+        lnprob = -0.5 * z**2 - jnp.log(jnp.sqrt(2 * jnp.pi) * pi_err * value**2)
+        lnprob = jnp.where(value > 0, lnprob, -jnp.inf)
+        return lnprob
+
+
+    def ln_p_DM(self, value, dist, err):
+        """
+        DM-based prior on pulsar distance (Arzoumanian+ 2023 Eq. 21)
+        Flat between dist±err, Gaussian tails outside that range.
+        """
+        sigma = 0.25 * err
+        boxheight = 1.0 / (2.0 * err)
+        gaussheight = 1.0 / (jnp.sqrt(2.0 * jnp.pi) * sigma)
+        scale = boxheight / gaussheight
+        area = 1.0 + scale  # normalization factor
+
+        left  = norm.pdf(value, loc=dist - err, scale=sigma) * scale
+        mid   = boxheight
+        right = norm.pdf(value, loc=dist + err, scale=sigma) * scale
+
+        y = jnp.where(
+            value <= (dist - err), left,
+            jnp.where(value < (dist + err), mid, right)
+        )
+        lnprob = jnp.log(y / area + 1e-12)
+        lnprob = jnp.where(value > 0, lnprob, -jnp.inf)
+        return lnprob
+
+
+    # the additional prior weighting take the determinisitic model parameters as input
+    def psr_dists_lnprior(self, det_params, psr_phases, psr_dists):
+
+        # prior on pulsar distance when measured with parallax
+        lnpriors_PX_dist = vmap(lambda x, y, z : self.ln_p_PX(x, y, z),
+                                    in_axes=(0, 0, 0))(psr_dists, self.psr_dists_mean, self.psr_dists_std)
+        lnprior_PX_summed = jnp.sum(lnpriors_PX_dist[self.where_PX])
+
+        # prior on pulsar distance when measured with DM
+        lnpriors_DM_dist = vmap(lambda x, y, z : self.ln_p_DM(x, y, z),
+                                    in_axes=(0, 0, 0))(psr_dists, self.psr_dists_mean, self.psr_dists_std)
+        lnprior_DM_summed = jnp.sum(lnpriors_DM_dist[self.where_DM])
+
+        # Prometheus still samples pulsar distance using a normal prior,
+        # so we must subtract that log-density here
+        ln_normal_corrections = 0.5 * (psr_dists - self.psr_dists_mean)**2 / self.psr_dists_std**2
+        ln_normal_correction = jnp.sum(ln_normal_corrections[self.where_not_other])
+
+        # new "advanced" pulsar distance prior
+        return lnprior_PX_summed + lnprior_DM_summed + ln_normal_correction
 
 
     def _wrap_delays_func(self, func, with_psr_params):
