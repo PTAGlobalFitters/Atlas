@@ -45,7 +45,8 @@ def main():
     m = H.build(npsr=args.npsr, orf_name="hd", fixture=args.fixture,
                 include_ecorr=ec, **kw)
     red = m.red_params()
-    z = jnp.zeros((m.npsr, m.rn.nmodes))
+    D = m.det_params()
+    z = jnp.zeros((m.npsr, m.ncol))
     raw = jnp.concat(m.data.raw_residuals)
 
     info = machine()
@@ -53,7 +54,7 @@ def main():
                 fixture=args.fixture, npsr=m.npsr,
                 ntoa=int(sum(p.ntoa for p in m.psrs)),
                 nmodes=m.rn.nmodes, include_ecorr=ec,
-                latent_dims=int(m.npsr * m.rn.nmodes),
+                latent_dims=int(m.npsr * m.ncol),
                 n_red_params=len(m.rn.model.get_param_names()),
                 n_wn_params=int(np.asarray(m.wn_vec).size))
     print("  ".join(f"{k}={v}" for k, v in info.items() if k not in ("recorded",)))
@@ -61,15 +62,17 @@ def main():
 
     build = jax.jit(lambda ww: m.rn.get_helpers(reff=raw, white_noise_params=ww))
     frozen = jax.jit(jax.grad(
-        lambda q, zz: m.rn.lnposterior_reparam(m.helpers, q, zz)[0], argnums=(0, 1)))
+        lambda q, zz: m.rn.lnposterior_reparam(m.helpers, q, zz, D_params=D)[0],
+        argnums=(0, 1)))
 
     def joint(q, zz, ww):
         hh = m.rn.get_helpers(reff=raw, white_noise_params=ww)
-        return m.rn.lnposterior_reparam(hh, q, zz)[0]
+        return m.rn.lnposterior_reparam(hh, q, zz, D_params=D)[0]
     rebuilt = jax.jit(jax.grad(joint, argnums=(0, 1, 2)))
 
     pmarg = jax.jit(jax.grad(
-        lambda q, zz: m.rn.partial_marg_lnposterior(m.helpers, q, zz)[0], argnums=(0, 1)))
+        lambda q, zz: m.rn.partial_marg_lnposterior(m.helpers, q, zz, D_params=D)[0],
+        argnums=(0, 1)))
     zg = jnp.zeros((m.npsr, 2 * m.n_gwb))
 
     timings = [

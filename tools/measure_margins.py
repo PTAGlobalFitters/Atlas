@@ -137,11 +137,12 @@ print("\nModel-string corpus")
 for case, kw in H.CORPUS.items():
     mc = H.build(orf_name="zero", **kw)
     rc = mc.red_params(irn_overrides={1: (-14.7, 4.0)})
+    Dc = mc.det_params()
     rgc = np.random.default_rng(32)
-    zrc = rgc.normal(size=(mc.npsr, mc.rn.nmodes))
+    zrc = rgc.normal(size=(mc.npsr, mc.ncol))
     zpc = rgc.normal(size=(mc.npsr, 2 * mc.n_gwb))
-    vrc = float(mc.rn.lnposterior_reparam(mc.helpers, rc, jnp.asarray(zrc))[0]) + 0.5 * np.sum(zrc ** 2)
-    vpc = float(mc.rn.partial_marg_lnposterior(mc.helpers, rc, jnp.asarray(zpc))[0]) + 0.5 * np.sum(zpc ** 2)
+    vrc = float(mc.rn.lnposterior_reparam(mc.helpers, rc, jnp.asarray(zrc), D_params=Dc)[0]) + 0.5 * np.sum(zrc ** 2)
+    vpc = float(mc.rn.partial_marg_lnposterior(mc.helpers, rc, jnp.asarray(zpc), D_params=Dc)[0]) + 0.5 * np.sum(zpc ** 2)
     record(f"partial_marg vs reparam [{case}]", abs(vrc - vpc) / abs(vrc), 1e-9,
            f"{mc.rn.nmodes} cols")
 

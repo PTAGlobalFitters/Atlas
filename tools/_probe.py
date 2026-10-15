@@ -68,9 +68,23 @@ def main():
     psrs = [ProbePulsar(i) for i in range(len(z["names"]))]
     n_gtm = int(spec["n_gtm"])
     n_dm = int(spec["n_dm"])
+    n_det = int(spec.get("n_det", 0))
 
     adaptus = [z[f"adaptus{i}"] for i in range(len(psrs))] if n_gtm else None
     gtm_psd = jnp.asarray(z["gtm_psd"]) if n_gtm else None
+
+    # A det block needs its bin count, waveform, bounds and D_params.  All of
+    # them are passed only when there is one, so the probe still runs on
+    # revisions that predate the deterministic API.
+    if n_det:
+        from ATLAS.signals.deterministic.det_signals import cw_delay_evolve_float64
+        data_kw = {"num_det_bins": n_det}
+        det_kw = {"det_delay_function": cw_delay_evolve_float64,
+                  "det_parameter_bounds": z["det_bounds"]}
+        D = tuple(jnp.asarray(z[k]) for k in ("det_params", "psr_phases", "psr_dists"))
+        dk = {"D_params": D}
+    else:
+        data_kw, det_kw, dk = {}, {}, {}
 
     def zero_orf(angle):
         return jnp.zeros_like(jnp.asarray(angle))
@@ -80,7 +94,7 @@ def main():
     data = PTA_Data(
         psrs,
         num_gwb_bins=int(spec["n_gwb"]), num_irn_bins=int(spec["n_irn"]),
-        num_dm_bins=(n_dm or None),
+        num_dm_bins=(n_dm or None), **data_kw,
         adaptus_basis=adaptus, adaptus_size=(n_gtm or None),
         fixed_white_noise_params=None,
         linear_timing=bool(spec["linear_timing"]),
@@ -94,6 +108,7 @@ def main():
         spec["model_string"], use_pulsar_tspan=False,
         irn_psd_function=powerlaw, gwb_psd_function=powerlaw, orf_function=orf,
         dm_psd_function=(powerlaw if n_dm else None),
+        **det_kw,
         gt_psd_val=gtm_psd,
         irn_lower_bound_psd=jnp.array([-20.0, 0.0]),
         irn_upper_bound_psd=jnp.array([-11.0, 7.0]),
@@ -117,24 +132,29 @@ def main():
         "param_names": np.array(rn.model.get_param_names(), dtype="<U64"),
     }
 
-    nmodes = rn.nmodes
-    z_reparam = jnp.asarray(z["z_unit"][:, :nmodes])
+    # z whitens the stochastic columns only; a det block's are not reparameterised.
+    n_reparam = rn.nmodes - (rn.det_signal.num_coeff_det if n_det else 0)
+    z_reparam = jnp.asarray(z["z_unit"][:, :n_reparam])
     z_gwb = jnp.asarray(z["z_unit"][:, :2 * int(spec["n_gwb"])])
 
-    lp, coeff = rn.lnposterior_reparam(helpers, red, z_reparam)
+    lp, coeff = rn.lnposterior_reparam(helpers, red, z_reparam, **dk)
     out["reparam_logp"] = np.asarray(lp)
     out["reparam_coeff"] = np.asarray(coeff)
     gr, gz = jax.grad(
-        lambda q, zz: rn.lnposterior_reparam(helpers, q, zz)[0], argnums=(0, 1)
+        lambda q, zz: rn.lnposterior_reparam(helpers, q, zz, **dk)[0], argnums=(0, 1)
     )(red, z_reparam)
     out["reparam_grad_red"] = np.asarray(gr)
     out["reparam_grad_z"] = np.asarray(gz)
+    if n_det:
+        out["reparam_grad_det"] = np.asarray(jax.grad(
+            lambda c: rn.lnposterior_reparam(helpers, red, z_reparam,
+                                             D_params=(c, *D[1:]))[0])(D[0]))
 
-    pm, g = rn.partial_marg_lnposterior(helpers, red, z_gwb)
+    pm, g = rn.partial_marg_lnposterior(helpers, red, z_gwb, **dk)
     out["pmarg_logp"] = np.asarray(pm)
     out["pmarg_g"] = np.asarray(g)
     pgr, pgz = jax.grad(
-        lambda q, zz: rn.partial_marg_lnposterior(helpers, q, zz)[0], argnums=(0, 1)
+        lambda q, zz: rn.partial_marg_lnposterior(helpers, q, zz, **dk)[0], argnums=(0, 1)
     )(red, z_gwb)
     out["pmarg_grad_red"] = np.asarray(pgr)
     out["pmarg_grad_z"] = np.asarray(pgz)
@@ -142,7 +162,7 @@ def main():
     # The gradient through the helper rebuild -- the vary_white=True hot path.
     def joint(q, zz, ww):
         hh = rn.get_helpers(reff=jnp.concat(data.raw_residuals), white_noise_params=ww)
-        return rn.lnposterior_reparam(hh, q, zz)[0]
+        return rn.lnposterior_reparam(hh, q, zz, **dk)[0]
     jr, jz, jw = jax.grad(joint, argnums=(0, 1, 2))(red, z_reparam, wn_vec)
     out["joint_grad_red"] = np.asarray(jr)
     out["joint_grad_z"] = np.asarray(jz)

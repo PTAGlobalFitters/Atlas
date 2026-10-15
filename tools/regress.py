@@ -64,6 +64,7 @@ def make_inputs(case, path, npsr, fixture):
     psrs = H.load_psrs(fixture, npsr)
     n_gtm = int(kw.get("n_gtm", 0))
     n_dm = int(kw.get("n_dm", 0))
+    n_det = int(kw.get("n_det", 0))
     n_gwb, n_irn = 4, 6
 
     payload = {"names": np.array([p.name for p in psrs], dtype="<U64")}
@@ -82,6 +83,12 @@ def make_inputs(case, path, npsr, fixture):
         for i, b in enumerate(basis):
             payload[f"adaptus{i}"] = np.asarray(b, dtype=np.float64)
         payload["gtm_psd"] = np.asarray(gtm_psd, dtype=np.float64)
+
+    if n_det:
+        payload["det_bounds"] = np.asarray(H.CW_BOUNDS, dtype=np.float64)
+        for key, arr in zip(("det_params", "psr_phases", "psr_dists"),
+                            H.cw_point(len(psrs))):
+            payload[key] = np.asarray(arr, dtype=np.float64)
 
     payload["wn_vec"] = np.asarray(
         H.white_noise_vector(psrs, kw.get("include_ecorr", True)), dtype=np.float64)
@@ -108,7 +115,7 @@ def make_inputs(case, path, npsr, fixture):
         include_ecorr=bool(kw.get("include_ecorr", True)),
         stabilize_TNT=False,
         orf="zero",
-        n_gwb=n_gwb, n_irn=n_irn, n_dm=n_dm, n_gtm=n_gtm,
+        n_gwb=n_gwb, n_irn=n_irn, n_dm=n_dm, n_gtm=n_gtm, n_det=n_det,
     )
     return spec
 
