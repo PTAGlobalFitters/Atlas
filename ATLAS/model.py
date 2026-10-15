@@ -97,8 +97,13 @@ def model_maker(raw_residuals,
             pulsar's physical timing parameters directly from their bounded
             priors (SINI, ECC from Uniform; affine params from a wide Normal).
     varied_chrom_index : bool, default ``False``
-        Varying the chromatic index from 0 to 6
-        
+        Sample a per-pulsar chromatic index for the ``dm`` block,
+        ``chromatic_index ~ Uniform(0, 6)[npsr]``, in place of the fixed DM
+        index of 2.  Needs a ``dm`` block in the model string, and helpers
+        rebuilt inside the model (``vary_white=True`` or ``tm_model`` not
+        None): the T-matrix changes with every draw, and pre-built helpers
+        cannot follow it.
+
     Notes
     -----
     The ``numpyro.factor`` cancellation:
@@ -112,11 +117,24 @@ def model_maker(raw_residuals,
     ValueError
         If ``vary_white=False``, ``tm_model`` is None, and ``helpers`` is
         None; the model has no way to build the white-noise products.
+        If ``varied_chrom_index=True`` without a ``dm`` block, or with
+        pre-built helpers that would ignore the sampled index.
     """
     if not vary_white and tm_model is None and helpers is None:
         raise ValueError(
             "helpers must be supplied when vary_white=False and tm_model is "
             "None; call super_sig.get_helpers() first and pass the result.")
+    if varied_chrom_index:
+        if super_sig.chrom_idxs is None:
+            raise ValueError(
+                "varied_chrom_index=True needs a dm block in the model string; "
+                "there is no chromatic basis to rescale.")
+        if not vary_white and tm_model is None:
+            raise ValueError(
+                "varied_chrom_index=True changes the T-matrix with every draw, "
+                "so the helpers must be rebuilt inside the model: set "
+                "vary_white=True or pass tm_model.  Pre-built helpers would "
+                "silently ignore the sampled index.")
 
     # ------------------------------------------------------------------ #
     #  Timing model                                                         #
@@ -139,7 +157,9 @@ def model_maker(raw_residuals,
     if varied_chrom_index:
         chrom_index = numpyro.sample('chromatic_index', 
                                     dist.Uniform(0, 6).expand((super_sig.data.npsrs,)))        
-        red_noise_basis = super_sig.update_red_basis(chrom_index = chrom_index)
+        # Rescale the caller's basis when given, so it stays a traced argument.
+        red_noise_basis = super_sig.update_red_basis(
+            chrom_index=chrom_index, red_noise_basis=red_noise_basis)
 
     # ------------------------------------------------------------------ #
     #  White-noise helper products                                          #
