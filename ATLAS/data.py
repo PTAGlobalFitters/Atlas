@@ -38,6 +38,11 @@ class PTA_Data:
     include_ecorr : bool
         Whether ECORR is identifiable for this dataset, detected from the TOA
         epochs. See :meth:`_detect_ecorr`.
+    psr_dists_dict : dict
+        Dictionary with pulsar names as keys, and tuple values specifying
+        (pulsar distance (kpc), uncertainty (kpc), measurement method). The
+        measurement method can be 'DM' or 'PX'. If dictionary does not contain
+        a particular pulsar, the pulsar objects will be used to define distances.
     """
 
     def __init__(self, 
@@ -56,7 +61,8 @@ class PTA_Data:
                 timfiles = None,
                 parfiles = None,
                 noise_dict = None,
-                dm_ref_freq = 1400): 
+                dm_ref_freq = 1400,
+                psr_dists_dict = {}):
         """The constructor for the PTA_Data class
 
         This class is intended to hold all the static data attributes of the PTA 
@@ -101,8 +107,11 @@ class PTA_Data:
         self.Mmat = [_timing_model_svd(psr.Mmat) for psr in psrs]
 
         # pulsar distances
-        self.psr_dists_mean = jnp.array([psr.pdist[0] for psr in psrs])
-        self.psr_dists_std = jnp.array([psr.pdist[1] for psr in psrs])
+        self.psr_dists_dict = psr_dists_dict
+        self.psr_dists_mean = jnp.array([self.psr_dists_dict[psr.name][0] if psr.name in list(self.psr_dists_dict.keys())
+                                         else psr.pdist[0] for psr in self.psrs])
+        self.psr_dists_std = jnp.array([self.psr_dists_dict[psr.name][1] if psr.name in list(self.psr_dists_dict.keys())
+                                        else psr.pdist[1] for psr in self.psrs])
         
         ######################PTA Data Analysis General Settings######################
         # Whether the white noise matrices are fixed (bool)
