@@ -83,6 +83,11 @@ __all__ = [
     "marginal_logL",
     "conditional_logL",
     "atlas_offset",
+    "chromatic_weight",
+    "chrom_quad_basis",
+    "interp_basis",
+    "sw_kernel",
+    "woodbury_marginal_logL",
 ]
 
 # ATLAS uses ``fref = 1 / (365.25 * 86400)`` in ``psd_functions``.
@@ -353,3 +358,120 @@ def epochs_from_toas(toas, backend_flags, dt=1.0):
                 epochs.append(np.sort(grp))
                 which.append(b)
     return epochs, np.array(which)
+
+
+# --------------------------------------------------------------------------- #
+#  Chromatic and solar-wind ingredients (NG20 v2.0 vanilla noise model)
+# --------------------------------------------------------------------------- #
+#
+# Written from the definitions in enterprise_extensions
+# (``chromatic.chromatic_quad_basis``) and PINT (``noise_model.TimeDomainSWNoise``
+# and its kernel functions), not from ATLAS.  The interpolation basis is built
+# by hand rather than through scipy, so it is independent of the scipy call
+# ATLAS shares with PINT.
+
+def chromatic_weight(freqs, chi, nu_ref=1400.0):
+    """``(nu_ref / nu)**chi`` per TOA."""
+    return (nu_ref / np.asarray(freqs, dtype=np.float64)) ** float(chi)
+
+
+def chrom_quad_basis(toas, freqs, chi, timing_basis=None, nu_ref=1400.0):
+    """enterprise_extensions ``chromatic_quad_basis``, optionally projected.
+
+    ``q_k = (t - t_mid)**k (nu_ref/nu)**chi``, k = 0, 1, 2, with ``t_mid`` the
+    midpoint of the TOA range; then ``q_k <- (I - U U^T) q_k`` when an
+    orthonormal ``timing_basis`` U is given; then each column to unit norm.
+    """
+    t = np.asarray(toas, dtype=np.float64)
+    t0 = 0.5 * (t.max() + t.min())
+    w = chromatic_weight(freqs, chi, nu_ref)
+    q = np.stack([(t - t0) ** k * w for k in range(3)], axis=1)
+    if timing_basis is not None:
+        U = np.asarray(timing_basis, dtype=np.float64)
+        q = q - U @ (U.T @ q)
+    return q / np.linalg.norm(q, axis=0)
+
+
+def interp_basis(toas_s, dt_days=None, nodes_mjd=None):
+    """Linear-interpolation ("tent") basis of PINT ``make_interpolation_basis``.
+
+    Nodes: ``nodes_mjd`` if given, else ``arange(t_min, t_max + dt, dt)`` in
+    days, exactly as PINT builds them.  Column j is 1 at node j, falls linearly
+    to 0 at its neighbours, and is 0 outside the node range.  Empty columns are
+    dropped.  Returns ``(L, nodes_s)``.
+    """
+    t = np.asarray(toas_s, dtype=np.float64)
+    if nodes_mjd is None:
+        nodes = np.arange(t.min() / 86400, t.max() / 86400 + dt_days, dt_days)
+    else:
+        nodes = np.sort(np.asarray(nodes_mjd, dtype=np.float64))
+    n = nodes * 86400
+    L = np.zeros((t.size, n.size))
+    for j in range(n.size):
+        if j > 0:
+            sel = (t >= n[j - 1]) & (t <= n[j])
+            L[sel, j] = (t[sel] - n[j - 1]) / (n[j] - n[j - 1])
+        if j < n.size - 1:
+            sel = (t >= n[j]) & (t < n[j + 1])
+            L[sel, j] = (n[j + 1] - t[sel]) / (n[j + 1] - n[j])
+    # a TOA exactly on an interior node belongs to that node alone
+    keep = L.sum(axis=0) != 0
+    return L[:, keep], n[keep]
+
+
+def sw_kernel(nodes_s, kind, log10_sigma, log10_ell=None, nu=1.5,
+              log10_gam_p=None, log10_p=None):
+    """PINT ``TimeDomainSWNoise`` node covariance, regulariser included.
+
+    ``ell`` in log10 days, ``p`` in log10 years, ``sigma`` in cm^-3.  All
+    non-RIDGE kernels carry PINT's ``(sigma / 50000)**2`` diagonal term.
+    """
+    x = np.asarray(nodes_s, dtype=np.float64)
+    tau = np.abs(x[:, None] - x[None, :])
+    s2 = 10.0 ** (2 * log10_sigma)
+    if kind == "RIDGE":
+        return s2 * np.eye(x.size)
+    ell = 10.0 ** log10_ell * 86400
+    if kind == "SQEXP":
+        k = np.exp(-tau ** 2 / (2 * ell ** 2))
+    elif kind == "MATERN":
+        r = tau / ell
+        if nu == 0.5:
+            k = np.exp(-r)
+        elif nu == 1.5:
+            k = (1 + np.sqrt(3) * r) * np.exp(-np.sqrt(3) * r)
+        else:
+            k = (1 + np.sqrt(5) * r + 5 * r ** 2 / 3) * np.exp(-np.sqrt(5) * r)
+    elif kind == "QUASI_PERIODIC":
+        p = 10.0 ** log10_p * 365.25 * 86400
+        k = np.exp(-tau ** 2 / (2 * ell ** 2)
+                   - 10.0 ** log10_gam_p * np.sin(np.pi * tau / p) ** 2)
+    else:
+        raise ValueError(kind)
+    return s2 * k + np.eye(x.size) * s2 / 50000 ** 2
+
+
+def woodbury_marginal_logL(r, T_blocks, phi, N, include_2pi=True):
+    """``ln p(r)`` for ``r ~ N(0, N + T phi T^T)``, through Woodbury.
+
+    Same quantity as :func:`marginal_logL`.  Needed once ``phi`` holds a
+    near-flat block (the chromatic quadratic: prior s.d. 1 s on unit-norm
+    columns): forming ``C`` densely then costs ~1e-3 nats in float64, while
+    ``N^-1``, ``phi^-1`` and ``Sigma^-1 = T^T N^-1 T + phi^-1`` all stay well
+    conditioned.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    T = block_diag(*[np.asarray(t, dtype=np.float64) for t in T_blocks])
+    cN = cho_factor(np.asarray(N, dtype=np.float64), lower=True)
+    NiT, Nir = cho_solve(cN, T), cho_solve(cN, r)
+    cp = cho_factor(np.asarray(phi, dtype=np.float64), lower=True)
+    S = T.T @ NiT + cho_solve(cp, np.eye(T.shape[1]))
+    cS = cho_factor(S, lower=True)
+    b = T.T @ Nir
+    quad = r @ Nir - b @ cho_solve(cS, b)
+    logdet = 2.0 * (np.sum(np.log(np.diag(cN[0]))) + np.sum(np.log(np.diag(cp[0])))
+                    + np.sum(np.log(np.diag(cS[0]))))
+    out = -0.5 * (quad + logdet)
+    if include_2pi:
+        out -= 0.5 * r.size * np.log(2 * np.pi)
+    return float(out)

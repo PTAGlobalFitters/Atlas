@@ -829,13 +829,22 @@ class SuperSignal:
         """
         self.signal_combination_string = signal_combination_string
         self.data = data
+
         # extract data anlaysis settings from data object
         self.fixed_wn = self.data.fixed_wn
         self.fixed_res = self.data.fixed_res
         self.linear_timing = self.data.linear_timing
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
-        
+
+        include_timing = sutils.parse_basis_string(signal_combination_string)['include_timing']
+        if self.linear_timing and not self.marg_tm and not include_timing:
+            raise ValueError(
+                "linear_timing=True with marg_timing=False needs the timing "
+                "columns in the T-matrix: prefix the combination string with "
+                f"'ltm|' (got {signal_combination_string!r}), or set "
+                "marg_timing=True.")
+                
         # linear timing model attributes
         if self.marg_tm:
             self.linear_timing_model_size = 0
@@ -858,6 +867,20 @@ class SuperSignal:
             # build_basis returns the dm block achromatic; give it the DM index.
             self.get_Fmat_concat = self._scale_chromatic(
                 self.get_Fmat_concat, jnp.ones(self.data.npsrs) * DM_CHROM_INDEX)
+
+        # Extra per-pulsar blocks (chrom / cquad / sw): any signal flagged
+        # `is_extra_block`.  They must be separate (not shared) blocks; their
+        # phi comes from `extra_components` in the phi model, in column order.
+        self.extra_names = sorted(
+            [n for n, s in self.signal_map.items() if getattr(s, 'is_extra_block', False)],
+            key=lambda n: self.signal_comb_idxs[n].start)
+        shared = sutils.parse_basis_string(self.signal_combination_string)['shared_names']
+        bad = [n for n in self.extra_names if n in shared]
+        if bad:
+            raise ValueError(f"{bad} must be separate blocks (after ';'), not shared.")
+        # Blocks whose basis follows the sampled chromatic-GP index.
+        self.chrom_gp_names = [n for n in self.extra_names
+                               if hasattr(self.signal_map[n], 'rescale')]
 
         # Total column count of the assembled T-matrix: timing + every Fourier
         # block + any deterministic block.  NOT 2*nfreqs of a single signal.
@@ -909,6 +932,32 @@ class SuperSignal:
         # Relative to the DM index the basis already carries, so no second,
         # achromatic copy of the dm block has to be stored or traced.
         return self._scale_chromatic(red_noise_basis, chrom_index - DM_CHROM_INDEX)
+
+    def update_chrom_gp_basis(self, chrom_gp_index, red_noise_basis=None):
+        """Re-index the chromatic-GP blocks (``chrom`` and ``cquad``) per pulsar.
+
+        Both blocks share one index, as in enterprise ``chrom_quad``: the GP
+        columns are rescaled by ``(f_ref/nu)**(index - reference)`` and the
+        quadratic is rebuilt (renormalised, timing projected out if enabled).
+
+        Args:
+            chrom_gp_index: (npsrs,) chromatic index per pulsar.
+            red_noise_basis: T-matrix to update; defaults to
+                ``get_Fmat_concat``.  Its chromatic blocks must still be at the
+                reference index, so pass the basis as built (it may already
+                carry an ``update_red_basis`` DM re-indexing -- the blocks are
+                disjoint).
+        Returns:
+            The updated basis.
+        """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        for name in self.chrom_gp_names:
+            sl = self.signal_comb_idxs[name]
+            sig = self.signal_map[name]
+            red_noise_basis = red_noise_basis.at[:, sl].set(
+                sig.rescale(red_noise_basis[:, sl], chrom_gp_index))
+        return red_noise_basis
 
     def _scale_chromatic(self, basis, chrom_index):
         """Scale each TOA's row of the dm block by ``(f_ref / f_radio)**chrom_index``."""
@@ -1143,6 +1192,10 @@ class SuperSignal:
                 f_dm                  = self.signal_map['dm'].freqs,
             )
 
+        if self.extra_names:
+            model_kwargs['extra_components'] = [
+                self.signal_map[n].extra_component() for n in self.extra_names]
+
         if not self.has_cor:
             model_kwargs.update(dict(
                 Npulsars                 = self.data.npsrs,
@@ -1346,7 +1399,7 @@ class SuperSignal:
         # unconditionally is what made both reparameterised likelihoods raise
         # KeyError('timing') for any string without 'ltm'.
         P_parts = [self.signal_comb_idxs[k]
-                   for k in ('timing', 'unc', 'dm', 'gtm')
+                   for k in ('timing', 'unc', 'dm', 'gtm', *self.extra_names)
                    if k in self.signal_comb_idxs]
         if not P_parts:
             raise ValueError(

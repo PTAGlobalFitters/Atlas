@@ -31,7 +31,9 @@ def model_maker(raw_residuals,
                 fixed_white_noise_params=None,
                 red_noise_basis=None,
                 tm_direct_sampling_type='klam',
-                varied_chrom_index = False
+                varied_chrom_index = False,
+                varied_chrom_gp_index = False,
+                chrom_gp_index_bounds = (0.0, 7.0),
                 ):
     """NumPyro model for the ATLAS global fit.
 
@@ -104,6 +106,18 @@ def model_maker(raw_residuals,
         None): the T-matrix changes with every draw, and pre-built helpers
         cannot follow it.
 
+    varied_chrom_gp_index : bool, default ``False``
+        Sample one chromatic index per pulsar shared by the ``chrom`` (GP) and
+        ``cquad`` (chromatic quadratic) blocks, ``chrom_gp_index ~
+        Uniform(*chrom_gp_index_bounds)[npsr]`` -- the coupled index of
+        enterprise ``chrom_quad``.  Independent of ``varied_chrom_index``
+        (which re-indexes the ``dm`` block).  The T-matrix changes with
+        every draw, so the helpers are rebuilt inside the model: with
+        ``vary_white=True``, with ``tm_model``, or -- unlike
+        ``varied_chrom_index`` -- with the white noise held fixed at
+        ``fixed_white_noise_params`` (or at the data object's fixed values).
+    chrom_gp_index_bounds : tuple, default ``(0.0, 7.0)``
+
     Notes
     -----
     The ``numpyro.factor`` cancellation:
@@ -120,10 +134,27 @@ def model_maker(raw_residuals,
         If ``varied_chrom_index=True`` without a ``dm`` block, or with
         pre-built helpers that would ignore the sampled index.
     """
-    if not vary_white and tm_model is None and helpers is None:
+    # Fixed white noise, fixed residuals, but a sampled chromatic-GP index:
+    # the helpers are rebuilt each draw from the fixed white-noise values.
+    rebuild_fixed_wn = (varied_chrom_gp_index and not vary_white
+                        and tm_model is None)
+    if not vary_white and tm_model is None and helpers is None \
+            and not rebuild_fixed_wn:
         raise ValueError(
             "helpers must be supplied when vary_white=False and tm_model is "
             "None; call super_sig.get_helpers() first and pass the result.")
+    if varied_chrom_gp_index:
+        if not getattr(super_sig, 'chrom_gp_names', None):
+            raise ValueError(
+                "varied_chrom_gp_index=True needs a chrom or cquad block in the "
+                "model string.")
+        if rebuild_fixed_wn and fixed_white_noise_params is None \
+                and not super_sig.fixed_wn:
+            raise ValueError(
+                "varied_chrom_gp_index=True changes the T-matrix with every "
+                "draw, so the helpers are rebuilt inside the model: pass "
+                "fixed_white_noise_params (or set vary_white=True, or pass "
+                "tm_model).  Pre-built helpers would ignore the index.")
     if varied_chrom_index:
         if super_sig.chrom_idxs is None:
             raise ValueError(
@@ -160,6 +191,12 @@ def model_maker(raw_residuals,
         # Rescale the caller's basis when given, so it stays a traced argument.
         red_noise_basis = super_sig.update_red_basis(
             chrom_index=chrom_index, red_noise_basis=red_noise_basis)
+    if varied_chrom_gp_index:
+        chrom_gp_index = numpyro.sample(
+            'chrom_gp_index',
+            dist.Uniform(*chrom_gp_index_bounds).expand((super_sig.data.npsrs,)))
+        red_noise_basis = super_sig.update_chrom_gp_basis(
+            chrom_gp_index=chrom_gp_index, red_noise_basis=red_noise_basis)
 
     # ------------------------------------------------------------------ #
     #  White-noise helper products                                          #
@@ -180,6 +217,16 @@ def model_maker(raw_residuals,
             white_noise_params=fixed_white_noise_params,
             red_noise_basis=red_noise_basis,
         )
+    elif rebuild_fixed_wn:
+        # Residuals and white noise fixed; only the basis moved.  Values bound
+        # into get_helpers at construction (fixed_wn / fixed_res) are left
+        # alone rather than overridden with None.
+        kw = dict(red_noise_basis=red_noise_basis)
+        if not super_sig.fixed_res:
+            kw['reff'] = stochastic_res
+        if not super_sig.fixed_wn:
+            kw['white_noise_params'] = fixed_white_noise_params
+        helpers_now = super_sig.get_helpers(**kw)
     else:
         # White noise and residuals are both fixed; use pre-built helpers.
         helpers_now = helpers

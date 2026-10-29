@@ -302,6 +302,21 @@ def infinitepower(f, df):
     return jnp.full_like(f, 1e40)
 
 
+@jax.jit
+def ridge(f, df, log10_amp):
+    """Constant prior variance ``10**(2*log10_amp)`` for every column pair.
+
+    Not a spectrum: ``f`` and ``df`` are only used for their shape.  This is
+    the coefficient prior for blocks whose basis already carries all the
+    structure -- the time-domain solar-wind GP (where ``log10_amp`` is PINT's
+    ``TDSWLOGSIG``, the n_E amplitude in cm^-3) and the chromatic quadratic
+    (where it is held fixed at a large value, an effectively flat prior).
+    Named ``log10_amp`` so that a ``renorm_const`` unit change shifts it like
+    any other amplitude.  Deliberately not clipped.
+    """
+    return jnp.full_like(f, 10.0 ** (2.0 * log10_amp))
+
+
 ##############################################################################################
 @jax.jit
 def param_hd_orf(angle, a, b, c):

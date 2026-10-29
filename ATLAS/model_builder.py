@@ -1,6 +1,8 @@
 from ATLAS.signals import signals_utils as sutils
 import jax
 from ATLAS.signals.factorized.base import Red, SuperSignal, GaussianTiming
+from ATLAS.signals.factorized.chromatic import (
+    ChromaticRed, ChromaticQuad, TimeDomainSolarWind, DEFAULT_CHROM_INDEX)
 from ATLAS.signals.correlated.base import Correlated
 from ATLAS.nMatrix.base import WhiteCov
 from ATLAS.signals.deterministic.base import Deterministic
@@ -131,7 +133,19 @@ class ModelBuilder:
                        gwb_lower_bound_psd=None,
                        gwb_upper_bound_psd=None,
                        det_parameter_bounds=None,
-                       gt_psd_val=None):
+                       gt_psd_val=None,
+                       # ---- chromatic GP (`chrom`) ----
+                       chrom_psd_function=None,
+                       chrom_lower_bound_psd=None,
+                       chrom_upper_bound_psd=None,
+                       num_chrom_bins=30,
+                       chrom_index=DEFAULT_CHROM_INDEX,
+                       # ---- chromatic quadratic (`cquad`) ----
+                       cquad_log10_amp=0.0,
+                       cquad_project_timing=True,
+                       # ---- time-domain solar wind (`sw`) ----
+                       sw_geometry=None,
+                       sw_kwargs=None):
         """Assemble and return a ``SuperSignal`` from named components.
 
         Which components are built is determined entirely by the names that
@@ -160,6 +174,25 @@ class ModelBuilder:
         ``'det'``
             Deterministic signal (``Deterministic``).  Requires
             ``det_delay_function`` and ``det_parameter_bounds``.
+        ``'chrom'``
+            Chromatic (scattering-like) Fourier GP, ``ChromaticRed``, scaled
+            by ``(f_ref/nu)**chrom_index``.  Requires ``chrom_psd_function``
+            and its bound arrays; ``num_chrom_bins`` frequencies.
+        ``'cquad'``
+            Chromatic quadratic (enterprise ``chrom_quad``), ``ChromaticQuad``,
+            at the same ``chrom_index``; marginalised with a fixed broad prior
+            (``cquad_log10_amp``), optionally with the timing model projected
+            out (``cquad_project_timing``).  No sampled parameters.
+        ``'sw'``
+            Time-domain solar-wind GP, ``TimeDomainSolarWind`` (port of PINT
+            ``TimeDomainSWNoise``).  Requires ``sw_geometry``; kernel, nodes
+            and priors go in ``sw_kwargs`` (see that class, and
+            ``read_tdsw_par`` for par-file settings).
+
+        The extra blocks must be separate blocks listed after ``dm``/``gtm``
+        in the string, in a fixed order, e.g.
+        ``"ltm|unc+cor->unc ; dm, chrom, cquad, sw"``.  Sample the shared
+        chromatic index with ``model_maker(..., varied_chrom_gp_index=True)``.
 
         Parameters
         ----------
@@ -256,6 +289,34 @@ class ModelBuilder:
                 use_pulsar_tspan=use_pulsar_tspan,
             ))
 
+        if 'chrom' in red_signal_names:
+            signals.append(ChromaticRed(
+                name='chrom',
+                psd_function=chrom_psd_function,
+                nfreqs=num_chrom_bins,
+                lower_bound_psd=chrom_lower_bound_psd,
+                upper_bound_psd=chrom_upper_bound_psd,
+                data=self.data,
+                use_pulsar_tspan=use_pulsar_tspan,
+                chrom_index=chrom_index,
+            ))
+        if 'cquad' in red_signal_names:
+            signals.append(ChromaticQuad(
+                name='cquad',
+                data=self.data,
+                chrom_index=chrom_index,
+                log10_amp=cquad_log10_amp,
+                project_timing=cquad_project_timing,
+            ))
+        if 'sw' in red_signal_names:
+            if sw_geometry is None:
+                raise ValueError("an 'sw' block needs sw_geometry (per-pulsar, in pc).")
+            signals.append(TimeDomainSolarWind(
+                name='sw',
+                data=self.data,
+                sw_geometry=sw_geometry,
+                **(sw_kwargs or {}),
+            ))
         if 'det' in red_signal_names:
             signals.append(Deterministic(
                 name='det',

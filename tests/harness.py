@@ -349,3 +349,176 @@ CORPUS = {
                             marg_timing=True, n_det=6),
     "ltm-det": dict(model_string="ltm|unc+cor->unc;det", linear_timing=True, n_det=6),
 }
+
+
+# --------------------------------------------------------------------------- #
+#  NG20 v2.0 vanilla noise: chrom, cquad, sw
+# --------------------------------------------------------------------------- #
+#
+# `build_ng20` mirrors `build` for the chromatic and solar-wind blocks.  The
+# reference side (`ng20_dense`) assembles T and phi per pulsar from
+# `reference`, in the column order `SuperSignal.build_basis` produces:
+# [timing | unc (cor nested at its head) | separate blocks in string order].
+# Zero padding columns ATLAS adds (cquad's 4th column, sw up to the widest
+# pulsar) are left out of the reference: a zero column of T changes nothing
+# in C = N + T phi T^T.
+
+NG20_CHROM_BINS = 7
+NG20_SW_DT_DAYS = 60.0
+NG20_DMCONST = 1.0 / 2.41e-4        # PINT's DMconst, s MHz^2 cm^3 / pc
+NG20_MATERN = dict(kernel="MATERN", log10_ell=2.0, nu=1.5)
+
+NG20_CORPUS = {
+    "curn-all":   dict(model_string="unc+cor->unc;dm,chrom,cquad,sw"),
+    "irn-all":    dict(model_string="unc;dm,chrom,cquad,sw"),
+    "ltm-all":    dict(model_string="ltm|unc+cor->unc;dm,chrom,cquad,sw"),
+    "curn-chrom": dict(model_string="unc+cor->unc;dm,chrom"),
+    "curn-sw":    dict(model_string="unc+cor->unc;dm,sw"),
+    "curn-matern": dict(model_string="unc+cor->unc;dm,chrom,cquad,sw", sw_kernel="MATERN"),
+}
+
+
+def sw_geometry_synth(psr):
+    """A smooth, positive, annually modulated stand-in for the solar-wind
+    geometry [pc].  The real one comes from PINT; the algebra does not care."""
+    t = np.asarray(psr.toas, dtype=np.float64)
+    return 1e-5 * (1.5 + np.cos(2 * np.pi * t / 3.15581e7 + 0.3 * t.size))
+
+
+@dataclass
+class NG20Model:
+    psrs: list
+    data: object
+    rn: object
+    helpers: tuple
+    wn_vec: jnp.ndarray
+    residuals: np.ndarray
+    blocks: tuple            # ordered stochastic blocks after unc, e.g. ('dm', 'chrom', ...)
+    has_cor: bool
+    n_tm: int
+    chrom_index: float
+    cquad_project: bool
+    sw_kernel: str
+    n_irn: int
+    n_gwb: int
+    n_dm: int
+    n_chrom: int
+
+    @property
+    def npsr(self):
+        return len(self.psrs)
+
+    def theta(self, seed=0):
+        """One draw of every sampled hyperparameter, as a dict of lists."""
+        rng = np.random.default_rng(seed)
+        n = self.npsr
+        return dict(
+            irn=[(rng.uniform(-15.5, -14.0), rng.uniform(2, 5)) for _ in range(n)],
+            dm=[(rng.uniform(-15.5, -14.0), rng.uniform(1, 4)) for _ in range(n)],
+            chrom=[(rng.uniform(-16.0, -14.0), rng.uniform(1, 4)) for _ in range(n)],
+            sw=[rng.uniform(-0.5, 0.8) for _ in range(n)],
+            gwb=(rng.uniform(-15.5, -14.5), 13 / 3))
+
+    def red_params(self, theta):
+        """``theta`` -> the flat vector, by name, so this cannot drift from
+        ``get_param_names``."""
+        vals = {}
+        for i, psr in enumerate(self.data.psr_names):
+            psr = str(psr)
+            vals[f"{psr}_irn_log10_A"], vals[f"{psr}_irn_gamma"] = theta["irn"][i]
+            vals[f"{psr}_dm_log10_A"], vals[f"{psr}_dm_gamma"] = theta["dm"][i]
+            vals[f"{psr}_chrom_log10_A"], vals[f"{psr}_chrom_gamma"] = theta["chrom"][i]
+            vals[f"{psr}_sw_log10_amp"] = theta["sw"][i]
+        vals["gwb_log10_A"], vals["gwb_gamma"] = theta["gwb"]
+        return jnp.array([vals[k] for k in self.rn.model.get_param_names()])
+
+
+@lru_cache(maxsize=16)
+def build_ng20(model_string="unc+cor->unc;dm,chrom,cquad,sw", npsr=2,
+               n_irn=6, n_gwb=4, n_dm=5, n_chrom=NG20_CHROM_BINS,
+               chrom_index=4.0, cquad_project=True, sw_kernel="RIDGE"):
+    from ATLAS.signals.signals_utils import parse_basis_string
+    psrs = load_psrs("synth", npsr)
+    linear_timing = model_string.startswith("ltm|")
+    data = PTA_Data(
+        psrs, num_gwb_bins=n_gwb, num_irn_bins=n_irn, num_dm_bins=n_dm,
+        num_det_bins=None, adaptus_basis=None, adaptus_size=None,
+        fixed_white_noise_params=None, linear_timing=linear_timing,
+        marg_timing=False, diag_white_cov=False, fixed_res=False,
+        timfiles=None, parfiles=None, noise_dict=None, dm_ref_freq=DM_REF_FREQ)
+    WhiteCov(data=data, stabilize_TNT=False, include_ecorr=True)
+    lo, hi = jnp.array([-20.0, 0.0]), jnp.array([-11.0, 7.0])
+    sw_kwargs = dict(dt_days=NG20_SW_DT_DAYS)
+    if sw_kernel != "RIDGE":
+        sw_kwargs.update(NG20_MATERN)
+    rn = ModelBuilder(data=data).make_red_noise(
+        model_string,
+        irn_psd_function=powerlaw, gwb_psd_function=powerlaw, orf_function=ZERO_ORF,
+        dm_psd_function=powerlaw, chrom_psd_function=powerlaw,
+        irn_lower_bound_psd=lo, irn_upper_bound_psd=hi,
+        gwb_lower_bound_psd=lo, gwb_upper_bound_psd=hi,
+        dm_lower_bound_psd=lo, dm_upper_bound_psd=hi,
+        chrom_lower_bound_psd=lo, chrom_upper_bound_psd=hi,
+        num_chrom_bins=n_chrom, chrom_index=chrom_index,
+        cquad_project_timing=cquad_project,
+        sw_geometry=[sw_geometry_synth(p) for p in psrs], sw_kwargs=sw_kwargs)
+    wn_vec = white_noise_vector(psrs, True)
+    helpers = rn.get_helpers(reff=jnp.concat(data.raw_residuals), white_noise_params=wn_vec)
+    cfg = parse_basis_string(model_string)
+    return NG20Model(psrs, data, rn, helpers, wn_vec,
+                     np.concatenate([np.asarray(p.residuals) for p in psrs]),
+                     tuple(n for n in cfg["separate_names"] if n != "unc"),
+                     "cor" in cfg["shared_names"],
+                     rn.linear_timing_model_size, chrom_index, cquad_project,
+                     sw_kernel, n_irn, n_gwb, n_dm, n_chrom)
+
+
+def ng20_dense(model, theta, chi=None):
+    """Per-pulsar reference ``T_p`` and the global ``phi`` for ``theta``.
+
+    ``chi`` (per pulsar) is the chromatic index of chrom and cquad; defaults
+    to the index the model was built with.
+    """
+    chi = [model.chrom_index] * model.npsr if chi is None else list(chi)
+    tspan = float(model.data.pta_tspan)
+    df = 1.0 / tspan
+    f = lambda n: np.arange(1, n + 1) / tspan
+    T_blocks, phis = [], []
+    for i, p in enumerate(model.psrs):
+        t, nu = np.asarray(p.toas, float), np.asarray(p.freqs, float)
+        cols, ph = [], []
+        if model.n_tm:
+            Ms = svd_basis(p.Mmat)
+            Mp = np.zeros((t.size, model.n_tm)); Mp[:, :Ms.shape[1]] = Ms
+            cols.append(Mp)
+            ph.append(np.where(np.arange(model.n_tm) < Ms.shape[1], 1e40, 1.0))
+        irn = ref.powerlaw_psd(f(model.n_irn), df, *theta["irn"][i])
+        if model.has_cor:
+            irn[:model.n_gwb] += ref.powerlaw_psd(f(model.n_gwb), df, *theta["gwb"])
+        cols.append(ref.fourier_basis(t, f(model.n_irn))); ph.append(np.repeat(irn, 2))
+        for blk in model.blocks:
+            if blk == "dm":
+                cols.append(ref.fourier_basis(t, f(model.n_dm))
+                            * ref.chromatic_weight(nu, 2.0, DM_REF_FREQ)[:, None])
+                ph.append(np.repeat(ref.powerlaw_psd(f(model.n_dm), df, *theta["dm"][i]), 2))
+            elif blk == "chrom":
+                cols.append(ref.fourier_basis(t, f(model.n_chrom))
+                            * ref.chromatic_weight(nu, chi[i], DM_REF_FREQ)[:, None])
+                ph.append(np.repeat(ref.powerlaw_psd(f(model.n_chrom), df, *theta["chrom"][i]), 2))
+            elif blk == "cquad":
+                U = svd_basis(p.Mmat) if model.cquad_project else None
+                cols.append(ref.chrom_quad_basis(t, nu, chi[i], U, DM_REF_FREQ))
+                ph.append(np.ones(3))                        # cquad_log10_amp = 0
+            elif blk == "sw":
+                L, nodes = ref.interp_basis(t, dt_days=NG20_SW_DT_DAYS)
+                cols.append(L * (sw_geometry_synth(p) * NG20_DMCONST / nu ** 2)[:, None])
+                if model.sw_kernel == "RIDGE":
+                    ph.append(ref.sw_kernel(nodes, "RIDGE", theta["sw"][i]))
+                else:
+                    kw = {k: v for k, v in NG20_MATERN.items() if k != "kernel"}
+                    ph.append(ref.sw_kernel(nodes, "MATERN", theta["sw"][i], **kw))
+            else:
+                raise ValueError(f"no reference for block {blk!r}")
+        T_blocks.append(np.hstack(cols))
+        phis.append(block_diag(*[np.diag(x) if x.ndim == 1 else x for x in ph]))
+    return T_blocks, block_diag(*phis)

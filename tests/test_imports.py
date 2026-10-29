@@ -33,6 +33,7 @@ CORE = [
     "ATLAS.nMatrix.base",
     "ATLAS.signals.signals_utils",
     "ATLAS.signals.factorized.base",
+    "ATLAS.signals.factorized.chromatic",
     "ATLAS.signals.correlated.base",
     "ATLAS.signals.deterministic.base",
 ]

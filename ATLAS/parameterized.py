@@ -250,6 +250,125 @@ def _bin_idx_to_mode_idx(idx_arr):
     idx_arr = jnp.asarray(idx_arr)
     return jnp.stack([2 * idx_arr, 2 * idx_arr + 1], axis=1).reshape(-1)
 
+# ---------------------------------------------------------------------------
+# Generic extra per-pulsar blocks (chromatic GP, chromatic quadratic,
+# time-domain solar wind, ...)
+# ---------------------------------------------------------------------------
+
+class _ExtraBlock:
+    """Bookkeeping for one extra block; plain attributes, built once."""
+    __slots__ = ("name", "psd_func", "bins", "bin_slice", "f", "df",
+                 "param_container", "varied_indxs", "n_varied", "p0", "p1",
+                 "fidxs", "K", "DIR", "fidxs_modes", "K_modes", "DIR_modes")
+
+
+class _ExtraBlocksMixin:
+    """Per-pulsar, pulsar-diagonal phi blocks beyond IRN / DM / GTM.
+
+    ``extra_components`` is a list of dicts, one per block, in T-matrix column
+    order::
+
+        {"name": str,               # key into signal_indices
+         "psd_func": callable,      # psd(f, df, *params) -> (bins,)
+         "helper_dictionary": dict, # as for dm (make_irn_model output)
+         "bins": int,               # = block columns / 2
+         "freqs": array}            # (bins,) or (Npulsars, bins)
+
+    Each block is bin-resolved like ``dm``: one phi value per column pair.
+    Its sampled parameters are appended to ``xs`` after every other block,
+    pulsar-major, starting at ``self.extra_start_idx``.
+    """
+
+    def _init_extra_blocks(self, extra_components, signal_indices, tm_offset,
+                           Npulsars, param_start):
+        self.extra_blocks = []
+        self.extra_start_idx = int(param_start)
+        idx = int(param_start)
+        upper, lower = [], []
+        diag_idx = jnp.arange(Npulsars)
+        for comp in (extra_components or []):
+            blk = _ExtraBlock()
+            blk.name = comp["name"]
+            sl = signal_indices[blk.name]
+            ncol = sl.stop - sl.start
+            if (sl.start - tm_offset) % 2 or ncol % 2:
+                raise ValueError(
+                    f"extra block {blk.name!r} must start on a column pair and "
+                    f"have an even width; got columns {sl} (timing offset "
+                    f"{tm_offset}).  Pad its basis with a zero column.")
+            blk.bin_slice = slice((sl.start - tm_offset) // 2,
+                                  (sl.stop - tm_offset) // 2)
+            blk.bins = ncol // 2
+            if comp.get("bins") is not None and int(comp["bins"]) != blk.bins:
+                raise ValueError(
+                    f"extra block {blk.name!r}: bins={comp['bins']} but "
+                    f"signal_indices spans {blk.bins} column pairs.")
+            f = jnp.asarray(comp["freqs"], dtype=float)
+            if f.ndim == 1:
+                f = jnp.broadcast_to(f, (Npulsars, blk.bins))
+            if f.shape != (Npulsars, blk.bins):
+                raise ValueError(
+                    f"extra block {blk.name!r}: freqs has shape {f.shape}, "
+                    f"needs ({blk.bins},) or ({Npulsars}, {blk.bins}).")
+            blk.f = f
+            blk.df = jnp.diff(jnp.concatenate((jnp.zeros((Npulsars, 1)), f), axis=1))
+            blk.psd_func = comp["psd_func"]
+            helper = comp["helper_dictionary"]
+            blk.param_container, blk.varied_indxs = _parse_psd_func(
+                blk.psd_func, helper, blk.bins)
+            blk.n_varied = int(len(blk.varied_indxs))
+            blk.p0, blk.p1 = idx, idx + blk.n_varied * Npulsars
+            idx = blk.p1
+            if blk.n_varied:
+                shift = _renorm_shift(
+                    _psd_signature_names(blk.psd_func, blk.bins)[
+                        np.asarray(blk.varied_indxs)],
+                    self.logrenorm_offset)
+                upper.append(jnp.tile(
+                    jnp.asarray(helper["psd_param_upper_lim"]) + shift, Npulsars))
+                lower.append(jnp.tile(
+                    jnp.asarray(helper["psd_param_lower_lim"]) + shift, Npulsars))
+            blk.fidxs = jnp.arange(blk.bin_slice.start, blk.bin_slice.stop)
+            blk.K = jnp.repeat(blk.fidxs[:, None], Npulsars, axis=1)
+            blk.DIR = jnp.repeat(diag_idx[None, :], blk.bins, axis=0)
+            blk.fidxs_modes = _bin_idx_to_mode_idx(blk.fidxs)
+            blk.K_modes = jnp.repeat(blk.fidxs_modes[:, None], Npulsars, axis=1)
+            blk.DIR_modes = jnp.repeat(diag_idx[None, :], 2 * blk.bins, axis=0)
+            self.extra_blocks.append(blk)
+        self.extra_end_idx = idx
+        self.num_extra_params = idx - int(param_start)
+        self.has_extra = len(self.extra_blocks) > 0
+        cat = lambda xs: jnp.concatenate(xs) if xs else jnp.array([])
+        return cat(upper), cat(lower)
+
+    def _extra_stops(self):
+        return [b.bin_slice.stop for b in getattr(self, "extra_blocks", [])]
+
+    def _eval_extra_psd(self, blk, xs):
+        """PSD of one extra block for every pulsar -> (bins, Npulsars)."""
+        per_psr = xs[blk.p0:blk.p1].reshape(self.Npulsars, blk.n_varied)
+
+        def _single(params, freqs_, df_):
+            filled = blk.param_container.at[blk.varied_indxs].set(params)
+            return blk.psd_func(freqs_, df_, *filled)
+
+        return jax.vmap(_single)(per_psr, blk.f, blk.df).T
+
+    def _add_extra_bins(self, phi_diag, xs):
+        """Add every extra block to a bin-resolution phi diagonal."""
+        for blk in self.extra_blocks:
+            phi_diag = phi_diag.at[blk.bin_slice].add(self._eval_extra_psd(blk, xs))
+        return phi_diag
+
+    def _extra_param_names(self):
+        names = []
+        for blk in self.extra_blocks:
+            pn = _psd_signature_names(blk.psd_func, blk.bins)[
+                np.asarray(blk.varied_indxs)]
+            for psr in self.pulsar_names:
+                names += [f"{psr}_{blk.name}_{q}" for q in pn]
+        return names
+
 
 # ---------------------------------------------------------------------------
 # Shared GTM (Gaussian timing model) geometry
@@ -397,7 +516,7 @@ class _GTMModeMixin:
 # Unified red-noise covariance-matrix class
 # ---------------------------------------------------------------------------
 
-class PerPulsarRedNoise(_GTMModeMixin):
+class PerPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
     """Red-noise covariance (phi) for a PTA with NO cross-pulsar correlations.
 
     Combines up to three per-pulsar spectral components -- intrinsic red noise
@@ -487,6 +606,8 @@ class PerPulsarRedNoise(_GTMModeMixin):
         f_gtm=None,
         gtm_psd=None,            # direct, mode-resolution GTM phi: (2*gtm_nfreqs, Npulsars)
         gtm_mode_resolved=True,  # one PSD value per basis COLUMN (see _GTMModeMixin)
+        # ---- extra per-pulsar blocks: chrom / cquad / sw (optional) ----
+        extra_components=None,
         # ---- shared ----
         renorm_const=1.0,
         Npulsars=1,
@@ -585,10 +706,11 @@ class PerPulsarRedNoise(_GTMModeMixin):
         # `has_*` are booleans, never None, so the old `is None` test could never
         # fire; with no component at all the failure was a bare
         # `max([])  ->  ValueError` from the n_total_bins line below.
-        if not (self.has_irn or self.has_dm or self.has_gtm):
+        if not (self.has_irn or self.has_dm or self.has_gtm or extra_components):
             raise ValueError(
                 "PerPulsarRedNoise needs at least one of `irn_psd_func`, "
-                "`dm_psd_func`, `gtm_psd_func`/`gtm_psd`.")
+                "`dm_psd_func`, `gtm_psd_func`/`gtm_psd`, `extra_components`.")
+        self._extra_components_arg = extra_components
 
         if has_irn:
             self.IRN_slice = _fourier_slice('unc')
@@ -604,6 +726,8 @@ class PerPulsarRedNoise(_GTMModeMixin):
         if self.has_irn: all_stops.append(self.IRN_slice.stop)
         if self.has_dm:  all_stops.append(self.DM_slice.stop)
         if self.has_gtm:  all_stops.append(self.GTM_slice.stop)
+        all_stops += [((signal_indices[c["name"]].stop - tm_offset) // 2)
+                      for c in (extra_components or [])]
         self.n_total_bins = max(all_stops)
 
         # ------------------------------------------------------------------ #
@@ -750,21 +874,26 @@ class PerPulsarRedNoise(_GTMModeMixin):
             upper = jnp.concatenate([upper, gtm_upper])
             lower = jnp.concatenate([lower, gtm_lower])
 
+        x_upper, x_lower = self._init_extra_blocks(
+            extra_components, signal_indices, tm_offset, self.Npulsars,
+            param_start=self.gtm_end_idx)
+        upper = jnp.concatenate([upper, x_upper])
+        lower = jnp.concatenate([lower, x_lower])
         self.upper_prior_lim_all = upper
         self.lower_prior_lim_all = lower
-
         # The parameter block sizes come from the PSD SIGNATURES, the prior
         # bounds come from the HELPER DICTIONARIES, and nothing tied the two
         # together.  A mismatch (e.g. a free-spectrum PSD, whose every bin is
         # varied, paired with an empty bounds array because the caller meant to
         # hold it fixed) silently produced an `xs` layout the prior does not
         # cover -- get_lnprior then compares arrays of different length.
-        n_expected = self.gtm_end_idx
+        n_expected = self.extra_end_idx
         if upper.shape[0] != n_expected:
             raise ValueError(
                 f"Prior bounds have {upper.shape[0]} entries but the parameter "
                 f"layout needs {n_expected} (IRN {self.num_IR_params} + DM "
-                f"{self.num_DM_params} + GTM {self.num_GTM_params}).  Check that "
+                f"{self.num_DM_params} + GTM {self.num_GTM_params} + extra "
+                f"{self.num_extra_params}).  Check that "
                 "each helper dictionary's psd_param_*_lim covers exactly the "
                 "varied parameters of its PSD function.")
 
@@ -907,6 +1036,8 @@ class PerPulsarRedNoise(_GTMModeMixin):
             else:
                 gtm_psd = 1.
             phi_diag = phi_diag.at[self.GTM_slice].add(gtm_psd)
+
+        phi_diag = self._add_extra_bins(phi_diag, xs)
 
         if self.gtm_mode_resolved:
             # Expand every bin into its two quadrature modes, then overwrite the
@@ -1079,7 +1210,7 @@ class PerPulsarRedNoise(_GTMModeMixin):
             ]
             for psr in self.pulsar_names:
                 names += [f"{psr}_gtm_{p}" for p in gtm_names]
-
+        names += self._extra_param_names()
         return names
 
     def get_param_names_and_priors(self):
@@ -1109,7 +1240,7 @@ class PerPulsarRedNoise(_GTMModeMixin):
         return -8.01
 
 
-class CorrelatedPulsarRedNoise(_GTMModeMixin):
+class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
     """Red-noise covariance (phi) for a PTA WITH a common, ORF-correlated process.
 
     Same per-pulsar components as ``PerPulsarRedNoise`` (``irn``, ``dm``,
@@ -1198,6 +1329,8 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         f_gtm=None,
         gtm_psd=None,            # direct, mode-resolution GTM phi: (2*gtm_nfreqs, Npulsars)
         gtm_mode_resolved=True,  # one PSD value per basis COLUMN (see _GTMModeMixin)
+        # ---- extra per-pulsar blocks: chrom / cquad / sw (optional) ----
+        extra_components=None,
         # ---- shared ----
         renorm_const=1.0,
         pulsar_names=None
@@ -1377,6 +1510,8 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         if has_irn: all_stops.append(self.IRN_slice.stop)
         if has_dm:  all_stops.append(self.DM_slice.stop)
         if has_gtm: all_stops.append(self.GTM_slice.stop)
+        all_stops += [((signal_indices[c["name"]].stop - tm_offset) // 2)
+                      for c in (extra_components or [])]
         self.n_total_bins = max(all_stops)
 
         # ------------------------------------------------------------------ #
@@ -1589,17 +1724,27 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
                 len(gwb_helper_dictionary["orf_param_upper_lim"]))
         else:
             self.n_orf_varied = 0
+        self.orf_end_idx = self.gwb_psd_end_idx + self.n_orf_varied
+
+        # Extra per-pulsar blocks go LAST, after the ORF parameters, so the
+        # established IRN | DM | GTM | GWB | ORF offsets do not move.
+        x_upper, x_lower = self._init_extra_blocks(
+            extra_components, signal_indices, tm_offset, Npulsars,
+            param_start=self.orf_end_idx)
+        upper = jnp.concatenate([upper, x_upper])
+        lower = jnp.concatenate([lower, x_lower])
 
         # See PerPulsarRedNoise for why this is checked: block sizes come from
         # the PSD signatures, bounds come from the helper dictionaries, and
         # nothing else ties the two together.
-        n_expected = self.gwb_psd_end_idx + self.n_orf_varied
+        n_expected = self.extra_end_idx
         if upper.shape[0] != n_expected:
             raise ValueError(
                 f"Prior bounds have {upper.shape[0]} entries but the parameter "
                 f"layout needs {n_expected} (IRN {self.num_IR_params} + DM "
                 f"{self.num_DM_params} + GTM {self.num_GTM_params} + GWB "
-                f"{int(len(self.gwb_varied_indxs))} + ORF {self.n_orf_varied}).")
+                f"{int(len(self.gwb_varied_indxs))} + ORF {self.n_orf_varied} "
+                f"+ extra {self.num_extra_params}).")
 
         self.upper_prior_lim_all = upper
         self.lower_prior_lim_all = lower
@@ -1693,7 +1838,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         dm  = xs[self.irn_end_idx:self.dm_end_idx]
         gtm = xs[self.dm_end_idx:self.gtm_end_idx]
         gwb = xs[self.gtm_end_idx:self.gwb_psd_end_idx]
-        orf = xs[self.gwb_psd_end_idx:]
+        orf = xs[self.gwb_psd_end_idx:self.orf_end_idx]
         return irn, dm, gtm, gwb, orf
 
     # ---------------------------------------------------------------------- #
@@ -1734,8 +1879,8 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
                 gtm_psd = 1.
             phi_diag = phi_diag.at[self.GTM_slice].add(gtm_psd)
 
+        phi_diag = self._add_extra_bins(phi_diag, xs)
         phi_diag = phi_diag.at[self.GWB_slice].add(psd_common)
-
         return phi_diag, psd_common
 
     @jit_method
@@ -1937,6 +2082,13 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
             )
             logdet_phi = logdet_phi + jnp.sum(jnp.log(diags_gtm))
 
+            # --- extra blocks (chrom / cquad / sw): diagonal inversion ---
+            for blk in self.extra_blocks:
+                diags_x = phi[blk.fidxs_modes].diagonal(axis1=-2, axis2=-1)
+                phiinv = phiinv.at[blk.K_modes, blk.DIR_modes, blk.DIR_modes].set(
+                    1.0 / diags_x)
+                logdet_phi = logdet_phi + jnp.sum(jnp.log(diags_x))
+
             # No outer doubling here: `phi` already has one row per true
             # Fourier mode, so summing logdet contributions over all of its
             # rows already accounts for both quadrature components.
@@ -1968,6 +2120,12 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
             diags_gtm = phi[self.GTM_fidxs].diagonal(axis1=-2, axis2=-1)
             phiinv = phiinv.at[self.KGTM, self.DIRGTM, self.DIRGTM].set(1.0 / diags_gtm)
             logdet_phi = logdet_phi + jnp.sum(jnp.log(diags_gtm))
+
+        # --- extra blocks (chrom / cquad / sw): diagonal inversion ---
+        for blk in self.extra_blocks:
+            diags_x = phi[blk.fidxs].diagonal(axis1=-2, axis2=-1)
+            phiinv = phiinv.at[blk.K, blk.DIR, blk.DIR].set(1.0 / diags_x)
+            logdet_phi = logdet_phi + jnp.sum(jnp.log(diags_x))
 
         return jnp.repeat(phiinv, 2, axis=0), 2.0 * logdet_phi
 
@@ -2016,7 +2174,8 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         n_irn_modes = 2 * (self.IRN_slice.stop - self.IRN_slice.start) if self.has_irn else 0
         n_dm_modes  = 2 * (self.DM_slice.stop  - self.DM_slice.start)  if self.has_dm  else 0
         n_gtm_modes = 2 * (self.GTM_slice.stop - self.GTM_slice.start) if self.has_gtm else 0
-        n_non_gwb_modes = n_irn_modes + n_dm_modes + n_gtm_modes
+        n_extra_modes = sum(2 * b.bins for b in self.extra_blocks)
+        n_non_gwb_modes = n_irn_modes + n_dm_modes + n_gtm_modes + n_extra_modes
 
         phi_diag_non_gwb = jnp.zeros((n_non_gwb_modes, self.Npulsars))
 
@@ -2032,6 +2191,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
                         (irn_local.stop if irn_local else 0) + n_dm_modes) if self.has_dm else None
         _dm_or_irn_stop = dm_local.stop if dm_local else (irn_local.stop if irn_local else 0)
         gtm_local = slice(_dm_or_irn_stop, _dm_or_irn_stop + n_gtm_modes) if self.has_gtm else None
+        _x0 = _dm_or_irn_stop + (n_gtm_modes if self.has_gtm else 0)
 
         if self.has_irn:
             phi_diag_non_gwb = phi_diag_non_gwb.at[irn_local].set(
@@ -2046,6 +2206,10 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
             # the bin-resolved fallback (and the fixed gtm_psd case).
             phi_diag_non_gwb = phi_diag_non_gwb.at[gtm_local].set(
                 self._gtm_mode_values(gtm_flat))
+        for blk in self.extra_blocks:
+            phi_diag_non_gwb = phi_diag_non_gwb.at[_x0:_x0 + 2 * blk.bins].set(
+                jnp.repeat(self._eval_extra_psd(blk, xs), 2, axis=0))
+            _x0 += 2 * blk.bins
 
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         phi_gwb = phi_gwb.at[:, self.diag_idx, self.diag_idx].set(psd_common)
@@ -2086,13 +2250,15 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         present = [(name, sl) for name, sl in
                    (('unc', getattr(self, 'IRN_slice', None)),
                     ('dm',  getattr(self, 'DM_slice',  None)),
-                    ('gtm', getattr(self, 'GTM_slice', None)))
+                    ('gtm', getattr(self, 'GTM_slice', None)),
+                    *[(b.name, b.bin_slice) for b in self.extra_blocks])
                    if sl is not None]
         for (n0, s0), (n1, s1) in zip(present, present[1:]):
             if s0.stop != s1.start:
                 raise ValueError(
                     "partial_reparm_helper lays the non-GWB phi block out as "
-                    "IRN | DM | GTM, so those basis columns must be contiguous "
+                    "IRN | DM | GTM | extra blocks (in model-string order), so "
+                    "those basis columns must be contiguous "
                     f"and in that order; got {n0}={s0} then {n1}={s1}.  Reorder "
                     "the signal-combination string.")
 
@@ -2194,7 +2360,7 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin):
         if not self.orf_fixed:
             orf_names = _orf_signature_names(self.orf_func)
             names += [f"orf_{p}" for p in orf_names]
-
+        names += self._extra_param_names()
         return names
 
     def get_param_names_and_priors(self):
