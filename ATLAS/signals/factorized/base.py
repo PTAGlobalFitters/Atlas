@@ -829,7 +829,6 @@ class SuperSignal:
         """
         self.signal_combination_string = signal_combination_string
         self.data = data
-
         # extract data anlaysis settings from data object
         self.fixed_wn = self.data.fixed_wn
         self.fixed_res = self.data.fixed_res
@@ -837,6 +836,9 @@ class SuperSignal:
         self.marg_tm = self.data.marg
         self.Mmat = self.data.Mmat
 
+        # Linear, UN-marginalised timing needs its columns in the T-matrix;
+        # without `ltm|` every column offset below shifts by the timing width
+        # and the log-density comes out NaN instead of failing.
         include_timing = sutils.parse_basis_string(signal_combination_string)['include_timing']
         if self.linear_timing and not self.marg_tm and not include_timing:
             raise ValueError(
@@ -844,7 +846,7 @@ class SuperSignal:
                 "columns in the T-matrix: prefix the combination string with "
                 f"'ltm|' (got {signal_combination_string!r}), or set "
                 "marg_timing=True.")
-                
+        
         # linear timing model attributes
         if self.marg_tm:
             self.linear_timing_model_size = 0
@@ -881,6 +883,11 @@ class SuperSignal:
         # Blocks whose basis follows the sampled chromatic-GP index.
         self.chrom_gp_names = [n for n in self.extra_names
                                if hasattr(self.signal_map[n], 'rescale')]
+        # Their T-matrix columns (static), for partial helper updates.
+        self.chrom_gp_cols = (np.concatenate([sutils._as_positions(self.signal_comb_idxs[n])
+                                              for n in self.chrom_gp_names])
+                              if self.chrom_gp_names else np.zeros(0, dtype=int))
+        self._partial_cores = {}
 
         # Total column count of the assembled T-matrix: timing + every Fourier
         # block + any deterministic block.  NOT 2*nfreqs of a single signal.
@@ -1151,6 +1158,81 @@ class SuperSignal:
         get_helpers.core = core
 
         return get_helpers
+
+    def get_helpers_partial(self, red_noise_basis, base_helpers, cols=None, **kwargs):
+        """TNT / TNr / rNr / logdet_N after a change to only some columns of T.
+
+        Recomputes ``C^T N^-1 [T | r]`` for the changed columns ``C`` and
+        writes it into ``base_helpers``; see
+        ``WhiteCov.get_red_helpers_partial``.  ``base_helpers`` must come from
+        ``get_helpers`` with the SAME white noise and residuals, and every
+        column outside ``cols`` must be unchanged.
+
+        Parameters
+        ----------
+        red_noise_basis : array [n_toas, nmodes]
+            The updated T-matrix (traced).
+        base_helpers : tuple
+            Previous ``(TNT, TNr, rNr, logdet_N)`` (traced).
+        cols : 1-D int array or slice, optional
+            Columns that changed (static).  Defaults to the chromatic-GP
+            columns (``chrom`` and ``cquad``), the ones ``update_chrom_gp_basis``
+            rewrites.
+        **kwargs
+            ``white_noise_params`` / ``reff`` when not bound at construction,
+            as for ``get_helpers``.
+        """
+        cols = self.chrom_gp_cols if cols is None else cols
+        key = tuple(int(c) for c in sutils._as_positions(cols))
+        core = self._partial_cores.get(key)
+        if core is None:
+            bound = dict(N_list=self.data.Nmat, cols=np.asarray(key, dtype=int))
+            if self.fixed_wn:
+                bound['white_noise_params'] = self.data.fixed_white_noise_params
+            if self.fixed_res:
+                bound['reff'] = jnp.concat(self.data.raw_residuals)[:, None]
+            core = jit(partial(self._partial_unjitted, **bound))
+            self._partial_cores[key] = core
+        return core(red_noise_basis=red_noise_basis, base_helpers=base_helpers, **kwargs)
+
+    def get_static_helpers(self, red_noise_basis=None, **kwargs):
+        """Residual-independent helper parts ``(TNT, N^-1 T, logdet_N)``.
+
+        For a sampled nonlinear timing model with FIXED white noise and a
+        fixed basis: compute once, then ``get_helpers_from_static`` each step
+        (cost ~ n_toa * nmodes instead of n_toa * nmodes^2).  Pass
+        ``white_noise_params`` unless they were fixed at construction.
+        """
+        if red_noise_basis is None:
+            red_noise_basis = self.get_Fmat_concat
+        wn = kwargs.get('white_noise_params', self.data.fixed_white_noise_params
+                        if self.fixed_wn else None)
+        if not hasattr(self, '_static_core'):
+            self._static_core = jit(self.data.Nmat.get_static_helpers)
+        return self._static_core(red_noise_basis, wn)
+
+    def get_helpers_from_static(self, static, **kwargs):
+        """(TNT, TNr, rNr, logdet_N) from ``get_static_helpers`` and the
+        current residuals (``reff``, unless fixed at construction)."""
+        if not hasattr(self, '_from_static_core'):
+            bound = dict(N_list=self.data.Nmat)
+            if self.fixed_wn:
+                bound['white_noise_params'] = self.data.fixed_white_noise_params
+            if self.fixed_res:
+                bound['reff'] = jnp.concat(self.data.raw_residuals)
+            self._from_static_core = jit(partial(self._from_static_unjitted, **bound))
+        return self._from_static_core(static=static, **kwargs)
+
+    @staticmethod
+    def _from_static_unjitted(static, N_list, white_noise_params, reff):
+        return N_list.get_red_helpers_from_static(static, reff, white_noise_params)
+
+    @staticmethod
+    def _partial_unjitted(red_noise_basis, base_helpers, N_list, cols,
+                          white_noise_params, reff):
+        return N_list.get_red_helpers_partial(
+            red_noise_basis=red_noise_basis, cols=cols, base_helpers=base_helpers,
+            residuals=reff, white_noise_params=white_noise_params)
 
     def model_maker(self):
         """Build ``self.model``, the phi model for the assembled basis.

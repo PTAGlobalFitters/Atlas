@@ -1,0 +1,133 @@
+# ====================================================================== #
+#  ATLAS run configuration                                               #
+#  One base setup + a list of runs; each run overrides the base through  #
+#  dotted paths and is executed as one Ray task.                         #
+#     atlas-run check run_config.yaml     (validate; nothing runs)       #
+#     atlas-run run   run_config.yaml                                    #
+#  Keys left out take the defaults in ATLAS/runner/config.py.            #
+# ====================================================================== #
+config_version: 1
+
+ray:
+  address: null              # null = start Ray locally; "auto" = join a running cluster
+  num_cpus_per_run: 4
+  num_gpus_per_run: 1        # 0 for CPU; 0.5 packs two runs per GPU
+  max_concurrent_runs: null  # null = as many as the resources allow
+  max_retries: 1             # re-run a task whose worker died (not a Python error)
+  env_vars:                  # set in every worker before JAX is imported
+    XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    JAX_ENABLE_X64: "true"
+
+output:
+  root: ./atlas_runs         # relative paths are relative to this file
+  run_dir: "{root}/{run_name}"
+  format: npz                # npz | netcdf (ArviZ layout; needs xarray + netCDF4, or h5netcdf + h5py)
+  save:
+    samples: true
+    red_coefficients: false  # store the reparameterised coefficients z_a (large)
+    resolved_config: true
+    environment: true
+  skip_completed: true       # resume: runs with status 'done' are skipped
+  overwrite: false
+
+data:
+  source: par_tim            # par_tim | enterprise_pickle | atlas_npz
+  par_files: /path/to/NG20/*.par
+  tim_files: /path/to/NG20/*.tim
+  pickle: null               # source = enterprise_pickle: a pickled list of Pulsars
+  npz_dir: null              # source = atlas_npz
+  pulsars: all               # all | [J1909-3744, J1713+0747]
+  exclude: []
+  timing_package: pint       # pint | tempo2
+  ephem: DE440
+  noise_dict: /path/to/wn_dict.json
+  pulsar_distances: null     # {psr: [mean_kpc, std_kpc]}; needed for `det`
+  dm_ref_freq: 1400          # MHz; also the reference of chrom / cquad
+  cache_dir: ./atlas_cache   # pulsars and solar-wind geometry, computed once
+  load_jobs: 8               # parallel par/tim loading
+
+timing:
+  linear_timing: true
+  marg_timing: true          # false needs 'ltm|' at the start of basis_string
+  nonlinear:                 # sample the timing model with JUG
+    enabled: false
+    params_to_sample: null   # null = every fitted parameter in the par files
+    parametrization: klam
+
+white_noise:
+  vary: false                # false = fixed at data.noise_dict
+  include_ecorr: auto        # auto | true | false
+  stabilize_TNT: false
+
+frequency_bins:
+  num_irn_bins: 30
+  num_gwb_bins: 14
+  num_dm_bins: 30
+  num_chrom_bins: 30
+  num_det_bins: null
+  use_pulsar_tspan: false
+
+model:
+  basis_string: "unc+cor->unc ; dm, chrom, cquad, sw"
+  priors_file: priors.yaml   # relative to this file
+  signals:
+    unc:
+      psd: powerlaw
+      priors: irn_powerlaw
+    cor:
+      psd: powerlaw
+      fixed: {gamma: 4.333333333333333}
+      orf: hd_orf            # hd_orf | zero_orf | monopole_orf | dipole_orf | param_hd_orf | ...
+      priors: gwb_powerlaw
+    dm:
+      psd: powerlaw
+      priors: dm_powerlaw
+      varied_index: false    # sample the dm block's index (needs white_noise.vary)
+    chrom:
+      psd: powerlaw
+      priors: chrom_powerlaw
+      chrom_index: 4.0       # number, or a yaml/json file {psr: chi, default: 4.0}
+      varied_index: false    # one chi per pulsar, shared by chrom and cquad
+      index_bounds: [2.5, 6.5]
+    cquad:
+      log10_amp: 0.0         # fixed prior s.d. (log10 s) on unit-norm columns
+      project_timing: true
+    sw:
+      geometry: pint         # pint | approx (cached in data.cache_dir)
+      settings_from_par: true  # TDSW* lines of each par file override the defaults
+      defaults: {kernel: RIDGE, dt_days: 30.0, interp_kind: linear}
+      fixed_log10_sigma: null
+      priors: sw_ridge
+    gtm:
+      basis_file: null       # npz, one [ntoa, k] array per pulsar name
+      psd_file: null         # npz with 'gtm_psd' [k, npsr]; null = unit variance
+    det:
+      waveform: cw_delay_evolve_float64
+      priors: cw
+
+sampler:
+  kind: nuts
+  marg_over_non_gwb: false   # true: keep only the GWB coefficients (needs `cor`)
+  nuts: {target_accept_prob: 0.8, max_tree_depth: 10, dense_mass: false}
+  num_warmup: 500
+  num_samples: 4000
+  num_chains: 1
+  chain_method: sequential   # sequential | vectorized | parallel
+  thinning: 1
+  seed: 170817               # run i uses seed + i unless it overrides sampler.seed
+  progress_bar: false
+
+runs:
+  - name: hd_vanilla
+  - name: hd_vanilla_chi_sampled
+    overrides:
+      model.signals.chrom.varied_index: true
+  - name: curn_vanilla
+    overrides:
+      model.signals.cor.orf: zero_orf
+
+# Optional: cartesian sweeps, expanded into runs named "<name>__<key>=<value>__...".
+sweeps: []
+#  - name: chi_scan
+#    grid:
+#      model.signals.chrom.chrom_index: [3.0, 4.0, 4.4]

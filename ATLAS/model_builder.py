@@ -121,6 +121,9 @@ class ModelBuilder:
                        use_pulsar_tspan=False,
                        irn_psd_function=None,
                        gwb_psd_function=None,
+                       irn_user_freqs = None,
+                       gwb_user_freqs = None,
+                       dm_user_freqs = None,
                        det_delay_function=None,
                        orf_function=None,
                        dm_psd_function=None,
@@ -136,6 +139,7 @@ class ModelBuilder:
                        gt_psd_val=None,
                        # ---- chromatic GP (`chrom`) ----
                        chrom_psd_function=None,
+                       chrom_user_freqs = None,
                        chrom_lower_bound_psd=None,
                        chrom_upper_bound_psd=None,
                        num_chrom_bins=30,
@@ -206,6 +210,10 @@ class ModelBuilder:
             ``psd_func(f, df, *params) -> (num_irn_bins,)``.
         gwb_psd_function : callable, optional
             ``psd_func(f, df, *params) -> (num_gwb_bins,)``.
+        irn_user_freqs : array, optional
+            Manually overwrite frequencies. Must be (n_psrs, nfreqs).
+        gwb_user_freqs : array, optional
+            Manually overwrite frequencies. Must be (nfreqs). 
         orf_function : callable, optional
             ``orf_func(angle, *params) -> (n_pairs,)``.
         dm_psd_function : callable, optional
@@ -246,6 +254,7 @@ class ModelBuilder:
                 upper_bound_psd=irn_upper_bound_psd,
                 data=self.data,
                 use_pulsar_tspan=use_pulsar_tspan,
+                user_freqs = irn_user_freqs,
             ))
 
         if 'gtm' in red_signal_names:
@@ -275,6 +284,7 @@ class ModelBuilder:
                 upper_bound_psd=gwb_upper_bound_psd,
                 upper_bound_orf=upper_bound_orf,
                 lower_bound_orf=lower_bound_orf,
+                user_freqs = gwb_user_freqs,
                 data=self.data,
             ))
 
@@ -285,6 +295,7 @@ class ModelBuilder:
                 nfreqs=self.data.num_dm_bins,
                 lower_bound_psd=dm_lower_bound_psd,
                 upper_bound_psd=dm_upper_bound_psd,
+                user_freqs = dm_user_freqs,
                 data=self.data,
                 use_pulsar_tspan=use_pulsar_tspan,
             ))
@@ -297,6 +308,7 @@ class ModelBuilder:
                 lower_bound_psd=chrom_lower_bound_psd,
                 upper_bound_psd=chrom_upper_bound_psd,
                 data=self.data,
+                user_freqs = chrom_user_freqs,
                 use_pulsar_tspan=use_pulsar_tspan,
                 chrom_index=chrom_index,
             ))

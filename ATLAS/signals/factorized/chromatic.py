@@ -112,6 +112,7 @@ class ChromaticRed(Red):
 
     def __init__(self, data, psd_function, lower_bound_psd, upper_bound_psd,
                  nfreqs=30, chrom_index=DEFAULT_CHROM_INDEX, name="chrom",
+                 user_freqs = None,
                  **red_kwargs):
         # Needed by get_basis(), which Red.__init__ calls.
         self.chrom_ref_index = jnp.asarray(
@@ -121,6 +122,7 @@ class ChromaticRed(Red):
         super().__init__(name=name, data=data, psd_function=psd_function,
                          lower_bound_psd=lower_bound_psd,
                          upper_bound_psd=upper_bound_psd, nfreqs=nfreqs,
+                         user_freqs = user_freqs,
                          **red_kwargs)
 
     def get_basis(self):

@@ -1,0 +1,46 @@
+# Prior bounds, uniform [low, high], for the SAMPLED parameters only, in the
+# order the PSD function takes them.  Fixed parameters (model.signals.*.fixed)
+# are left out.  For free_spectrum give one pair under `halflog10_rho`
+# (used for every bin) or a list with one pair per bin.
+
+irn_powerlaw:
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]
+
+gwb_powerlaw:                      # with cor.fixed: {gamma: ...} only log10_A is sampled
+  log10_A: [-18.0, -11.0]
+  orf: {}                          # e.g. {a: [-1, 1], b: [-1, 1], c: [-1, 1]} for param_hd_orf
+
+gwb_powerlaw_free_gamma:
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]
+
+gwb_free_spectrum:
+  halflog10_rho: [-9.0, -4.0]
+
+dm_powerlaw:
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]
+
+chrom_powerlaw:
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]
+
+sw_ridge:
+  log10_amp: [-3.0, 2.0]           # log10 sigma, cm^-3 (PINT TDSWLOGSIG)
+
+cw:                                # in the argument order of cw_delay_evolve_float64
+  log10_mc:   [7.2, 9.0]
+  log10_fgw:  [-8.7, -8.2]
+  cos_inc:    [-1.0, 1.0]
+  psi:        [0.0, 3.141592653589793]
+  log10_h:    [-18.0, -12.0]
+  cos_theta:  [-1.0, 1.0]
+  phi:        [0.0, 6.283185307179586]
+  phase0:     [0.0, 6.283185307179586]
+
+# White-noise bounds default to ATLAS's WhiteCov values; uncomment to override.
+# white_noise:
+#   efac:        [0.1, 10.0]
+#   log10_equad: [-10.0, -5.0]
+#   log10_ecorr: [-10.0, -5.0]

@@ -82,7 +82,7 @@ class Correlated:
                  nfreqs=10, 
                  halflog10_rho_range=(-9,-2), 
                  posterior_draw_ndraws = 1,
-                 user_freqs=jnp.array([False])
+                 user_freqs=None
                  ):
         """The constructor for the GWB_Freespectrum signal class.
 
@@ -147,7 +147,7 @@ class Correlated:
         self.npairs = self.data.npairs
         self.tspan = self.data.pta_tspan
         
-        if user_freqs.any():
+        if user_freqs is not None:
             self.freqs = user_freqs
             self.nfreqs = len(self.freqs)
             self.nmodes = 2 * self.nfreqs

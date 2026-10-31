@@ -13,7 +13,10 @@ from jug.engine.session import TimingSession
 from enterprise.pulsar import Pulsar as E_Pulsar
 import pint.logging
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+LINEAR_PARAMS = ('offset', 'f', 'dm', 'fd', 'jump')
 
 MAX_JOBS = 8
 LINEAR_PARAMS = ['offset','f','dm','fd','jump'] # Matt also said NE_SW, but I dunno what that is
@@ -180,51 +183,171 @@ class Pulsar:
             self.Mmat_linear = self.Mmat[:, self.Mmat_is_linear]
             self.Mmat_linear_labels = [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
 
-    # @property
-    # def Mmat_linear(self):
-    #     return self.Mmat[:, self.Mmat_is_linear]
-    
-    # @property
-    # def Mmat_linear_labels(self):
-    #     return [l for l, is_lin in zip(self.Mmat_labels, self.Mmat_is_linear) if is_lin]
-
-
 
 @dataclass
 class PulsarDataLoader:
-    par_file: str
-    tim_file: str
-    timing_package: str
+    """One pulsar's data.  Load:  PulsarDataLoader(**np.load(path))
+                            Save:  psr.save(path)
+    """
 
     # Basic info
     name: str
 
     # TOA data
-    toas: jnp.ndarray
-    residuals: jnp.ndarray
-    toaerrs: jnp.ndarray
-    freqs: jnp.ndarray
-    backend_flags: list
-
-    # Pulsar distance
-    pdist: jnp.ndarray
+    toas: np.ndarray                      # [s]
+    residuals: np.ndarray                 # [s]
+    toaerrs: np.ndarray                   # [s]
+    freqs: np.ndarray                     # [MHz]
+    backend_flags: np.ndarray             # str per TOA
 
     # Position
-    raj: float
-    decj: float
-    pos: jnp.ndarray
-
-    # Timing-model parameters
-    fit_param_names: list
-    fit_param_values: jnp.ndarray
-    fit_param_uncertainties: jnp.ndarray
+    pos: np.ndarray                       # unit 3-vector
 
     # Linearized design matrix
-    Mmat: jnp.ndarray
+    Mmat: np.ndarray
     Mmat_labels: list
-    Mmat_is_linear: jnp.ndarray
-    Mmat_linear: jnp.ndarray
-    Mmat_linear_labels: list
+
+    # ---- everything below is optional ---------------------------------
+    par_file: Optional[str] = None
+    tim_file: Optional[str] = None
+    timing_package: Optional[str] = None
+    raj: Optional[float] = None           # [rad]; computed from pos if missing
+    decj: Optional[float] = None
+    pdist: Optional[np.ndarray] = None    # (mean, std) kpc
+
+    # Timing-model parameters
+    fit_param_names: Optional[list] = None
+    fit_param_values: Optional[np.ndarray] = None
+    fit_param_uncertainties: Optional[np.ndarray] = None
+    Mmat_is_linear: Optional[np.ndarray] = None
+    Mmat_linear: Optional[np.ndarray] = None        # derived; kept for old files
+    Mmat_linear_labels: Optional[list] = None       # derived; kept for old files
+
+    # NEW: par file, timing params to sample, ephemeris
+    par_text: Optional[str] = None        # the par file itself (psr.write_par)
+    sample_params: Optional[list] = None  # timing params for nonlinear sampling
+    ephem: Optional[str] = None
+
+    # NEW: all TOA flags, as names + one row per flag
+    flag_names: Optional[np.ndarray] = None         # (n_flags,)
+    flag_values: Optional[np.ndarray] = None        # (n_flags, n_toa) str
+
+    # NEW: solar wind (DM for n_E = 1 cm^-3 at 1 AU) [pc]
+    sw_geometry: Optional[np.ndarray] = None
+    sw_geometry_method: Optional[str] = None        # 'pint' | 'approx' | ...
+
+    # NEW: Adaptus / GTM basis for this pulsar
+    adaptus_basis: Optional[np.ndarray] = None      # (n_toa, k)
+    adaptus_mean: Optional[np.ndarray] = None       # (n_toa,)
+    
+    def __post_init__(self):
+        s = lambda x: None if x is None else str(np.asarray(x).item() if np.ndim(x) == 0 else x)
+        sl = lambda x: None if x is None else [str(v) for v in np.asarray(x).reshape(-1)]
+        f = lambda x: None if x is None else np.asarray(x, dtype=np.float64)
+
+        # strings come out of np.load as 0-d arrays; make them plain str
+        for k in ('name', 'par_file', 'tim_file', 'timing_package', 'par_text',
+                  'ephem', 'sw_geometry_method'):
+            setattr(self, k, s(getattr(self, k)))
+        for k in ('Mmat_labels', 'fit_param_names', 'sample_params'):
+            setattr(self, k, sl(getattr(self, k)))
+        for k in ('toas', 'residuals', 'toaerrs', 'freqs', 'pos', 'Mmat', 'pdist',
+                  'fit_param_values', 'fit_param_uncertainties', 'sw_geometry',
+                  'adaptus_basis', 'adaptus_mean'):
+            setattr(self, k, f(getattr(self, k)))
+        self.backend_flags = np.asarray(self.backend_flags).astype(str)
+        if self.flag_names is not None:
+            self.flag_names = np.asarray(self.flag_names).astype(str)
+            self.flag_values = np.asarray(self.flag_values).astype(str)
+        for k in ('raj', 'decj'):
+            v = getattr(self, k)
+            setattr(self, k, None if v is None else float(np.asarray(v)))
+
+        # derived fields
+        if self.pdist is None:            # PTA_Data always reads pdist; enterprise's placeholder
+            self.pdist = np.array([1.0, 0.2])
+            
+        if self.raj is None or self.decj is None:
+            x, y, z = self.pos
+            self.raj, self.decj = float(np.arctan2(y, x) % (2 * np.pi)), float(np.arcsin(z))
+        if self.Mmat_is_linear is None:
+            self.Mmat_is_linear = [any(l.lower().startswith(p) for p in LINEAR_PARAMS)
+                                   for l in self.Mmat_labels]
+        self.Mmat_is_linear = np.asarray(self.Mmat_is_linear, dtype=bool)
+        self.Mmat_linear = self.Mmat[:, self.Mmat_is_linear]
+        self.Mmat_linear_labels = [l for l, b in zip(self.Mmat_labels, self.Mmat_is_linear) if b]
+        if self.fit_param_names is None:
+            self.fit_param_names = [l for l in self.Mmat_labels if l.lower() != 'offset']
+
+        # checks
+        n = self.toas.size
+        for k in ('residuals', 'toaerrs', 'freqs', 'backend_flags', 'sw_geometry', 'adaptus_mean'):
+            v = getattr(self, k)
+            if v is not None and np.shape(v) != (n,):
+                raise ValueError(f"{self.name}: {k} has shape {np.shape(v)}, expected ({n},)")
+        if self.Mmat.shape != (n, len(self.Mmat_labels)):
+            raise ValueError(f"{self.name}: Mmat {self.Mmat.shape} vs {n} TOAs / "
+                             f"{len(self.Mmat_labels)} labels")
+        if self.adaptus_basis is not None and self.adaptus_basis.shape[0] != n:
+            raise ValueError(f"{self.name}: adaptus_basis has {self.adaptus_basis.shape[0]} rows")
+        if self.flag_names is not None and self.flag_values.shape != (self.flag_names.size, n):
+            raise ValueError(f"{self.name}: flag_values must be (n_flags, n_toa)")
+
+    @property
+    def fitpars(self):                    # enterprise's name; used by make_timing_model
+        return list(self.Mmat_labels)
+
+    @property
+    def flags(self):                      # {flag: per-TOA str}
+        if self.flag_names is None:
+            return {}
+        return {str(k): v for k, v in zip(self.flag_names, self.flag_values)}
+
+    def write_par(self, directory):
+        import os
+        path = os.path.join(directory, f"{self.name}.par")
+        os.makedirs(directory, exist_ok=True)
+        with open(path, 'w') as fh:
+            fh.write(self.par_text)
+        return path
+
+    def save(self, path):
+        """Write every non-None field; reload with PulsarDataLoader(**np.load(path))."""
+        out = {}
+        for k, v in asdict(self).items():
+            if v is None or k in ('Mmat_linear', 'Mmat_linear_labels'):
+                continue                  # derived on load
+            if isinstance(v, (list, tuple)):
+                v = np.asarray(v, dtype=str if k != 'Mmat_is_linear' else bool)
+            out[k] = v
+        np.savez_compressed(path, **out)
+
+    @classmethod
+    def from_enterprise(cls, psr, sw_geometry=None, **extra):
+        """From an enterprise Pulsar (sort=False, drop_pintpsr=False).
+        ``sw_geometry``: an array, or 'pint' to compute it from psr.model."""
+        model = getattr(psr, 'model', None)
+        names = [l for l in psr.fitpars if l.lower() != 'offset']
+        kw = dict(name=psr.name, toas=psr.toas, residuals=psr.residuals,
+                  toaerrs=psr.toaerrs, freqs=psr.freqs, pos=psr.pos,
+                  backend_flags=psr.backend_flags, Mmat=psr.Mmat,
+                  Mmat_labels=list(psr.fitpars), raj=psr._raj, decj=psr._decj,
+                  pdist=np.asarray(getattr(psr, 'pdist', (1.0, 0.2)), float),
+                  flag_names=np.array(list(psr.flags), dtype=str),
+                  flag_values=np.array([np.asarray(v).astype(str) for v in psr.flags.values()]))
+        if model is not None:
+            kw.update(timing_package='pint', par_text=model.as_parfile(),
+                      fit_param_names=names,
+                      fit_param_values=[float(model[k].value) for k in names],
+                      fit_param_uncertainties=[float(model[k].uncertainty_value or 0) for k in names])
+        if isinstance(sw_geometry, str) and sw_geometry == 'pint':
+            from ATLAS.signals.factorized.chromatic import sw_geometry_from_pint
+            kw['sw_geometry'] = sw_geometry_from_pint(model, psr.pint_toas)
+            kw['sw_geometry_method'] = 'pint'
+        elif sw_geometry is not None:
+            kw['sw_geometry'] = sw_geometry
+        kw.update(extra)                  # e.g. sample_params=..., adaptus_basis=...
+        return cls(**kw)
 
 
 

@@ -12,6 +12,16 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 from functools import partial
 
+def _logdet_total(cov, white_noise_helpers):
+    """log|N| (or log|D| with the timing model marginalised) without a solve."""
+    logdet = cov.logdet_unmarg(white_noise_helpers)
+    if cov.marg:
+        NiM = cov._apply_inv_unmarg(white_noise_helpers, cov.Mmat)
+        cf = jsl.cho_factor(cov.Mmat.T @ NiM)
+        logdet = logdet + 2 * jnp.sum(jnp.log(cf[0].diagonal())) + cov.Mprior
+    return logdet
+
+
 # Helper functions for finding TOA epochs --------------------------------------
 def _get_psr_wn_attributes(psr):
     """Get the helper matrices for computing the white noise covariance matrix
@@ -189,6 +199,25 @@ class DiagSinglePulsarWhiteCov:
             return jit(new_func)
 
 
+    def _apply_inv_unmarg(self, white_noise_helpers, right):
+        """``N^{-1} right`` for the diagonal covariance."""
+        return right / white_noise_helpers[0][:, None]
+
+    def apply_inv(self, white_noise_helpers, right):
+        """``N^{-1} right`` (or ``D^{-1} right`` when the timing model is
+        marginalised), as a matrix the size of ``right``.
+
+        For ``left^T N^{-1} right`` with a small ``right`` and a wide ``left``,
+        ``left.T @ apply_inv(right)`` touches ``left`` only through one matrix
+        product, while ``solve`` also runs its epoch gathers over ``left``.
+        """
+        x = self._apply_inv_unmarg(white_noise_helpers, right)
+        if not self.marg:
+            return x
+        NiM = self._apply_inv_unmarg(white_noise_helpers, self.Mmat)       # [n, k]
+        cf = jsl.cho_factor(self.Mmat.T @ NiM)
+        return x - NiM @ jsl.cho_solve(cf, NiM.T @ right)
+
     def _solve_unmarg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system left^T N^{-1} right.
 
@@ -362,6 +391,14 @@ class SinglePulsarWhiteCov:
         self.U_pad = U_pad
         self.U_mask = U_mask
         self.V = V # To construct jvec
+        # Per-TOA epoch index for segment sums: toa_epoch[i] = the ECORR epoch
+        # of TOA i, or nepochs (a dummy segment) for TOAs in no epoch.  Lets
+        # the Sherman-Morrison terms be summed without padded gathers.
+        toa_epoch = np.full(self.ntoas, self.nepochs, dtype=np.int32)
+        for b in range(self.nepochs):
+            members = np.asarray(U_pad[b])[np.asarray(U_mask[b]) > 0]
+            toa_epoch[members] = b
+        self.toa_epoch = jnp.asarray(toa_epoch)
 
         # Prior Ranges--------------------------------------
         self.lower_efac = efac_prior_bounds[0] 
@@ -597,6 +634,43 @@ class SinglePulsarWhiteCov:
             new_func = partial(self._solve_unmarg, return_logdet = return_logdet)
             return jit(new_func)
 
+    def _apply_inv_unmarg(self, white_noise_helpers, right):
+        """``N^{-1} right`` with N = diag(nvec) + sum_b jvec_b u_b u_b^T.
+
+        Sherman-Morrison per epoch (epochs are disjoint):
+
+            N^{-1} R = A^{-1} R - A^{-1} U diag(j / (1 + j u^T A^{-1} u)) U^T A^{-1} R
+        """
+        nvec, jvec = white_noise_helpers
+        Ainv = 1 / nvec
+        AinvR = Ainv[:, None] * right                                       # [n, M]
+        nb = self.nepochs
+        if nb == 0:
+            return AinvR
+        seg = self.toa_epoch                                                # [n] in [0, nb]
+        # u_b^T A^{-1} R and u_b^T A^{-1} u_b for every epoch, without padding
+        UtAinvR = jax.ops.segment_sum(AinvR, seg, num_segments=nb + 1)[:nb]    # [b, M]
+        epoch_Ainv = jax.ops.segment_sum(Ainv, seg, num_segments=nb + 1)[:nb]  # [b]
+        w = UtAinvR * (jvec / (1.0 + jvec * epoch_Ainv))[:, None]          # [b, M]
+        # each TOA takes its epoch's correction (the dummy segment adds 0)
+        w = jnp.concatenate([w, jnp.zeros((1, w.shape[1]), w.dtype)], axis=0)
+        return AinvR - Ainv[:, None] * w[seg]
+
+    def apply_inv(self, white_noise_helpers, right):
+        """``N^{-1} right`` (or ``D^{-1} right`` when the timing model is
+        marginalised), as a matrix the size of ``right``.
+
+        For ``left^T N^{-1} right`` with a small ``right`` and a wide ``left``,
+        ``left.T @ apply_inv(right)`` touches ``left`` only through one matrix
+        product, while ``solve`` also runs its epoch gathers over ``left``.
+        """
+        x = self._apply_inv_unmarg(white_noise_helpers, right)
+        if not self.marg:
+            return x
+        NiM = self._apply_inv_unmarg(white_noise_helpers, self.Mmat)       # [n, k]
+        cf = jsl.cho_factor(self.Mmat.T @ NiM)
+        return x - NiM @ jsl.cho_solve(cf, NiM.T @ right)
+
     def _solve_unmarg(self, white_noise_helpers, left, right, return_logdet):
         """Solve the linear system ``left^T N^{-1} right``.
 
@@ -627,29 +701,16 @@ class SinglePulsarWhiteCov:
             ``left^T N^{-1} right`` of shape ``[N, M]``; if ``return_logdet``
             is True, the tuple ``(solve_result, logdet_N)`` instead.
         """
-        nvec, jvec = white_noise_helpers
-        # Get the diagonal bit.
-        Ainv = 1/nvec
-        # The low-rank bit (L^T Ainv R)
-        term1 = left.T @ (Ainv[:,None] * right) # (N, M)
-
-        # b is the number of blocks (epochs)
-        # LAinv is (b, N), RAinv is (b, M) (Mask is used to zero out the padded values)
-        epoch_Ainv = Ainv[self.U_pad]*self.U_mask                                    # (b, i)
-        LAinv = jnp.einsum('biN,bi -> bN', left[self.U_pad,:], epoch_Ainv)
-        RAinv = jnp.einsum('biM,bi -> bM', right[self.U_pad,:], epoch_Ainv)
-
-        # Sherman-Morrison correction, summed over epochs. Written as a single
-        # contraction rather than as a (b, N, M) outer product that is immediately
-        # reduced away: sum_b LAinv[b,n] * RAinv[b,m] * jvec[b] / denom[b] IS the
-        # matrix product below. XLA fuses the outer-product form so the (b, N, M)
-        # tensor is never materialised under jit, but the fused loop cannot reach
-        # cuBLAS and runs ~10x slower; it also forces a very long autotuning pass.
-        denom = 1.0 + jnp.einsum('n,nj -> n', jvec, epoch_Ainv)                      # (b)
-        term2 = LAinv.T @ (RAinv * (jvec / denom)[:, None])         # (N, M)
-
-
-        solve_result = term1 - term2
+        # N^{-1} (Sherman-Morrison per epoch) is applied to whichever of
+        # left / right has fewer columns, then ONE matrix product:
+        #     left^T N^{-1} right = (N^{-1} left)^T right = left^T (N^{-1} right)
+        # The epoch sums are segment sums (no padded gathers), so the cost is
+        # ~ n_toa * min(N, M) for the inverse plus one GEMM, which reaches
+        # cuBLAS on GPU.
+        if left.shape[1] <= right.shape[1]:
+            solve_result = self._apply_inv_unmarg(white_noise_helpers, left).T @ right
+        else:
+            solve_result = left.T @ self._apply_inv_unmarg(white_noise_helpers, right)
 
         if return_logdet:
             return solve_result, self.logdet_unmarg(white_noise_helpers)
@@ -688,25 +749,23 @@ class SinglePulsarWhiteCov:
             The result of the linear equation, shape ``[n, m]``; if
             ``return_logdet`` is True, the tuple ``(result, logdet_D)`` instead.
         """
-        # Solve L^T N^{-1} R - L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
-        # Term1 = L^T N^{-1} R
-        term1 = self.solve_unmarg(white_noise_helpers, left, right)
-
-        # Term2 = L^T N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1} R
-        MNM = self.solve_unmarg(white_noise_helpers, self.Mmat, self.Mmat)
-        LNM = self.solve_unmarg(white_noise_helpers, left, self.Mmat)
-        MNR = self.solve_unmarg(white_noise_helpers, self.Mmat, right)
-
-        # The covariance matrix MNM can be ill-conditioned, we should stabilize it
-        cf = jsl.cho_factor(MNM)
-        term2 = LNM @ jsl.cho_solve(cf, MNR)
+        # D^{-1} = N^{-1} - N^{-1} M (M^T N^{-1} M)^{-1} M^T N^{-1}, applied
+        # to the narrower of left / right, then one matrix product.  N^{-1} M
+        # is formed once per call (it was formed three times).
+        NiM = self._apply_inv_unmarg(white_noise_helpers, self.Mmat)       # [n, k]
+        cf = jsl.cho_factor(self.Mmat.T @ NiM)
+        narrow_left = left.shape[1] <= right.shape[1]
+        X = left if narrow_left else right
+        DiX = (self._apply_inv_unmarg(white_noise_helpers, X)
+               - NiM @ jsl.cho_solve(cf, NiM.T @ X))
+        result = DiX.T @ right if narrow_left else left.T @ DiX
 
         if return_logdet:
             logdet = self.logdet_unmarg(white_noise_helpers)\
                  + 2 * jnp.sum(jnp.log(cf[0].diagonal())) + self.Mprior
-            return term1 - term2, logdet
+            return result, logdet
         else:
-            return term1 - term2
+            return result
 
     @jit_method
     def logdet_unmarg(self, white_noise_helpers):
@@ -1043,6 +1102,7 @@ class WhiteCov:
         log_det_N: array [1]
         """
         N_basis = red_noise_basis.shape[1]
+        residuals = jnp.reshape(residuals, (-1,))
         FNF = jnp.zeros((self.npulsars, N_basis, N_basis))
         FNr = jnp.zeros((self.npulsars, N_basis))
 
@@ -1059,18 +1119,20 @@ class WhiteCov:
                 white_noise_helper = cov.get_nvec_jvec()
                 F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
                 r_p  = residuals[start:end]                             # [n_p]
-                # One solve per pulsar: right = [T_p | r_p]
+                # ONE Gram per pulsar: G = [T_p | r_p]^T N^{-1} [T_p | r_p]
+                # holds TNT, TNr and rNr; log|N| comes with it.
                 Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
-                res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
+                G, y = cov.solve_with_logdet(white_noise_helper, Fr_p, Fr_p)
+                G = 0.5 * (G + G.T)
 
-                FNF = FNF.at[pidx].set(res[:, :N_basis])
-                FNr = FNr.at[pidx].set(res[:, N_basis])
-
-                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
-                rNr += x
+                FNF = FNF.at[pidx].set(G[:N_basis, :N_basis])
+                FNr = FNr.at[pidx].set(G[:N_basis, N_basis])
+                rNr += G[N_basis, N_basis]
                 log_det_N += y
 
-            return FNF, FNr, rNr[0, 0], log_det_N
+            if self.stabilize:
+                return stabilize_TNT(FNF, FNF.shape[-1]), FNr, rNr, log_det_N
+            return FNF, FNr, rNr, log_det_N
 
         else:
             for pidx, cov, start, end in zip(self.pulsar_idxs, 
@@ -1085,21 +1147,170 @@ class WhiteCov:
                 white_noise_helper = cov.get_nvec_jvec(wn_params)
                 F_p  = red_noise_basis[start:end, :]                    # [n_p, N_basis]
                 r_p  = residuals[start:end]                             # [n_p]
-                # One solve per pulsar: right = [T_p | r_p]
+                # ONE Gram per pulsar: G = [T_p | r_p]^T N^{-1} [T_p | r_p]
+                # holds TNT, TNr and rNr; log|N| comes with it.
                 Fr_p = jnp.concatenate([F_p, r_p[:, None]], axis=1)     # [n_p, N_basis+1]
-                res  = cov.solve(white_noise_helper, F_p, Fr_p)         # [N_basis, N_basis+1]
+                G, y = cov.solve_with_logdet(white_noise_helper, Fr_p, Fr_p)
+                G = 0.5 * (G + G.T)
 
-                FNF = FNF.at[pidx].set(res[:, :N_basis])
-                FNr = FNr.at[pidx].set(res[:, N_basis])
-
-                x, y = cov.solve_with_logdet(white_noise_helper, r_p[:, None], r_p[:, None])
-                rNr += x
+                FNF = FNF.at[pidx].set(G[:N_basis, :N_basis])
+                FNr = FNr.at[pidx].set(G[:N_basis, N_basis])
+                rNr += G[N_basis, N_basis]
                 log_det_N += y
 
             if self.stabilize:
-                return stabilize_TNT(FNF, FNF.shape[-1]), FNr, rNr[0, 0], log_det_N
+                return stabilize_TNT(FNF, FNF.shape[-1]), FNr, rNr, log_det_N
             else:
-                return FNF, FNr, rNr[0, 0], log_det_N
+                return FNF, FNr, rNr, log_det_N
+
+    def _per_pulsar_wn(self, white_noise_params):
+        """(cov, start, end, white_noise_helper) per pulsar."""
+        out, i0 = [], 0
+        for cov, start, end in zip(self.cov_matrices, self.toa_starts, self.toa_ends):
+            if self.diag_white_cov:
+                wh = cov.get_nvec_jvec()
+            else:
+                i1 = i0 + cov.n_params
+                wh = cov.get_nvec_jvec(white_noise_params[i0:i1])
+                i0 = i1
+            out.append((cov, start, end, wh))
+        return out
+
+    def get_static_helpers(self, red_noise_basis, white_noise_params):
+        """The residual-independent parts of the helpers, computed once.
+
+        For runs where T and the white noise are fixed but the residuals change
+        every step (a sampled nonlinear timing model).  Returns
+        ``(TNT, NiT, logdet_N)``:
+
+        TNT      [npsr, N_basis, N_basis]  T^T N^{-1} T (stabilised if enabled)
+        NiT      [total_ntoas, N_basis]    N^{-1} T (D^{-1} T when marginalised)
+        logdet_N scalar
+
+        Pair with ``get_red_helpers_from_static`` each step.  Memory is one
+        extra T-sized array.
+        """
+        N_basis = red_noise_basis.shape[1]
+        TNT = jnp.zeros((self.npulsars, N_basis, N_basis))
+        NiT = []
+        logdet = 0.0
+        for pidx, (cov, start, end, wh) in zip(self.pulsar_idxs,
+                                               self._per_pulsar_wn(white_noise_params)):
+            T_p = red_noise_basis[start:end, :]
+            NiT_p = cov.apply_inv(wh, T_p)
+            G = NiT_p.T @ T_p
+            TNT = TNT.at[pidx].set(0.5 * (G + G.T))
+            NiT.append(NiT_p)
+            logdet = logdet + _logdet_total(cov, wh)
+        if self.stabilize:
+            TNT = stabilize_TNT(TNT, N_basis)
+        return TNT, jnp.concatenate(NiT, axis=0), logdet
+
+    def get_red_helpers_from_static(self, static, residuals, white_noise_params):
+        """``get_red_helpers`` output from ``get_static_helpers`` + new residuals.
+
+        Per step only T^T N^{-1} r = (N^{-1} T)^T r and r^T N^{-1} r are formed:
+        cost ~ n_toa * N_basis instead of n_toa * N_basis^2.  ``static`` must
+        come from the same T and white noise.
+        """
+        TNT, NiT, logdet = static
+        residuals = jnp.reshape(residuals, (-1,))
+        TNr = jnp.zeros((self.npulsars, TNT.shape[-1]))
+        rNr = 0.0
+        for pidx, (cov, start, end, wh) in zip(self.pulsar_idxs,
+                                               self._per_pulsar_wn(white_noise_params)):
+            r_p = residuals[start:end]
+            TNr = TNr.at[pidx].set(NiT[start:end].T @ r_p)
+            rNr = rNr + r_p @ cov.apply_inv(wh, r_p[:, None])[:, 0]
+        return TNT, TNr, rNr, logdet
+
+    def get_red_helpers_partial(self, red_noise_basis, cols, base_helpers,
+                                residuals, white_noise_params):
+        """Update ``get_red_helpers`` output where only some columns of T changed.
+
+        With ``C_p = T_p[:, cols]`` (the changed columns) and ``R_p = [T_p | r_p]``,
+        one solve per pulsar gives ``C_p^T N_p^{-1} R_p``.  That is exactly the
+        rows ``cols`` of ``T^T N^{-1} T`` (and, by symmetry, its columns
+        ``cols``) and the entries ``cols`` of ``T^T N^{-1} r``; everything else
+        in ``base_helpers`` is unchanged:
+
+            [ S'N^-1 S   S'N^-1 C ]      S'N^-1 S  : kept from base_helpers
+            [ C'N^-1 S   C'N^-1 C ]      the rest   : recomputed here
+
+        ``rNr`` and ``log|N|`` do not depend on T and are returned as given.
+        Cost per pulsar ~ n_toa * n_cols * (N_basis + 1) instead of
+        n_toa * N_basis * (N_basis + 1).
+
+        VALID ONLY IF ``base_helpers`` were computed with the same
+        ``white_noise_params`` and ``residuals``; the columns outside ``cols``
+        must also be unchanged.  Not supported with ``stabilize_TNT=True``: the
+        stabilising shift depends on the whole diagonal, so a partial update
+        cannot reproduce it.
+
+        Parameters
+        ----------
+        red_noise_basis : array [total_ntoas, N_basis]
+            The updated T-matrix.
+        cols : static 1-D int array or slice
+            Columns of T that changed.  Must be concrete (not traced).
+        base_helpers : tuple
+            ``(TNT, TNr, rNr, logdet_N)`` from ``get_red_helpers`` for the
+            previous T, same white noise and residuals.
+        residuals : array [total_ntoas]
+        white_noise_params : array
+            The global (concatenated) white-noise values (ignored for a
+            diagonal white-noise covariance).
+
+        Returns
+        -------
+        (TNT, TNr, rNr, logdet_N) with the same shapes as ``get_red_helpers``.
+        """
+        if self.stabilize:
+            raise NotImplementedError(
+                "partial helper updates are not available with stabilize_TNT=True; "
+                "use get_red_helpers")
+        TNT, TNr, rNr, log_det_N = base_helpers
+        N_basis = red_noise_basis.shape[1]
+        if isinstance(cols, slice):
+            cols = np.arange(*cols.indices(N_basis))
+        cols = np.asarray(cols, dtype=int)
+        if cols.size == 0:
+            return TNT, TNr, rNr, log_det_N
+        if cols.min() < 0 or cols.max() >= N_basis:
+            raise ValueError(f"cols out of range for a basis with {N_basis} columns")
+        if np.unique(cols).size != cols.size:
+            raise ValueError("cols must not repeat")
+
+        wn_params_start_idx = 0
+        for pidx, cov, start, end in zip(self.pulsar_idxs,
+                                         self.cov_matrices,
+                                         self.toa_starts,
+                                         self.toa_ends):
+            if self.diag_white_cov:
+                white_noise_helper = cov.get_nvec_jvec()
+            else:
+                wn_params_end_idx = wn_params_start_idx + cov.n_params
+                wn_params = white_noise_params[wn_params_start_idx: wn_params_end_idx]
+                wn_params_start_idx = wn_params_end_idx
+                white_noise_helper = cov.get_nvec_jvec(wn_params)
+
+            T_p = red_noise_basis[start:end, :]                     # [n_p, N_basis]
+            r_p = residuals[start:end]                              # [n_p]
+            C_p = T_p[:, cols]                                      # [n_p, n_cols]
+            # N^{-1} is applied to the narrow C_p only; T_p enters through one
+            # matrix product.  (cov.solve(C_p, [T_p | r_p]) gives the same
+            # numbers but runs its per-epoch gathers over every column of T_p.)
+            NiC = cov.apply_inv(white_noise_helper, C_p)            # [n_p, n_cols]
+            CNT = NiC.T @ T_p                                       # [n_cols, N_basis]
+            CNr = NiC.T @ r_p                                       # [n_cols]
+
+            A = TNT[pidx]
+            A = A.at[cols, :].set(CNT)
+            A = A.at[:, cols].set(CNT.T)
+            TNT = TNT.at[pidx].set(A)
+            TNr = TNr.at[pidx, cols].set(CNr)
+
+        return TNT, TNr, rNr, log_det_N
 
     def get_red_det_helpers(self, red_noise_basis, det_signal_basis,
                             residuals, white_noise_params):

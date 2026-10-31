@@ -30,7 +30,16 @@ dependencies = [
     "pint-pulsar",    # pulsar.py imports pint.logging directly
 ]
 
+[project.scripts]
+atlas-run = "ATLAS.runner.cli:main"
+
 [project.optional-dependencies]
+# Config-driven, Ray-parallel runs (ATLAS.runner / atlas-run).
+runner = [
+    "ray",
+    "pyyaml",
+]
+
 # Test suite. Deliberately does NOT need jug / libstempo / $TEMPO2: the tests
 # build models from serialized fixtures and never import ATLAS.pulsar.
 test = [
@@ -56,6 +65,9 @@ experimental = [
 
 [tool.setuptools.packages.find]
 include = ["ATLAS*"]
+
+[tool.setuptools.package-data]
+"ATLAS.runner" = ["templates/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
