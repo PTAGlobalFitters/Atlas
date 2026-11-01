@@ -23,7 +23,8 @@ log = logging.getLogger("ATLAS.runner")
 
 __all__ = ["data_key", "prepare_data", "load_pulsars", "pulsar_files",
            "sw_geometry", "sw_kwargs_for", "chrom_index_for", "load_noise_dict",
-           "load_distances", "load_gtm", "sw_geometry_approx", "match_toas"]
+           "load_distances", "load_gtm", "sw_geometry_approx", "match_toas",
+           "user_freqs", "timing_params_for"]
 
 
 # --------------------------------------------------------------------------- #
@@ -50,23 +51,43 @@ def _par_name(par):
     return Path(par).stem.split("_")[0]
 
 
-def pulsar_files(run):
+def _keep(path, exclude):
+    base = Path(path).name
+    return not any(x in base for x in exclude)
+
+
+def pulsar_files(run, names=None):
     """``{pulsar_name: (par, tim)}`` from data.par_files / data.tim_files.
 
     Pairs are matched by name (from the par file's PSR/PSRJ line, found in the
-    tim file's name), not by sort order.
+    tim file's name), not by sort order.  Files whose name contains any of
+    ``data.file_exclude`` (e.g. ``[ao, gbt]``) are ignored.  With ``names``,
+    only those pulsars are paired, and every one of them must pair; problems
+    are reported together.
     """
     d = run["data"]
-    pars, tims = _expand(run, d["par_files"]), _expand(run, d["tim_files"])
-    out = {}
+    excl = [str(x) for x in (d.get("file_exclude") or [])]
+    pars = [p for p in _expand(run, d["par_files"]) if _keep(p, excl)]
+    tims = [t for t in _expand(run, d["tim_files"]) if _keep(t, excl)]
+    by_name = {}
     for par in pars:
-        name = _par_name(par)
+        by_name.setdefault(_par_name(par), []).append(par)
+    want = list(by_name) if names is None else [str(n) for n in names]
+    out, problems = {}, []
+    for name in want:
+        cand = by_name.get(name, [])
+        if len(cand) != 1:
+            problems.append(f"{name}: expected 1 par file, found {len(cand)} {cand}")
+            continue
         hits = [t for t in tims if Path(t).name.startswith(name)] or \
                [t for t in tims if name in Path(t).name]
         if len(hits) != 1:
-            raise ConfigError(f"cannot pair {par} ({name}) with exactly one tim file; "
-                              f"candidates: {hits}")
-        out[name] = (par, hits[0])
+            problems.append(f"{name}: expected 1 tim file, found {len(hits)} {hits}")
+            continue
+        out[name] = (cand[0], hits[0])
+    if problems:
+        raise ConfigError(f"{len(problems)} pulsar(s) failed par/tim pairing "
+                          "(see data.file_exclude):\n  " + "\n  ".join(problems))
     return out
 
 
@@ -75,7 +96,9 @@ def data_key(run):
     d = run["data"]
     spec = dict(source=d["source"], ephem=d["ephem"], timing_package=d["timing_package"],
                 pars=_expand(run, d["par_files"]), tims=_expand(run, d["tim_files"]),
-                pickle=resolve_path(run, d["pickle"]), npz=resolve_path(run, d["npz_dir"]))
+                pickle=resolve_path(run, d["pickle"]), npz=resolve_path(run, d["npz_dir"]),
+                npz_files=resolve_path(run, d.get("npz_files")),
+                exclude=list(d.get("file_exclude") or []))
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -116,13 +139,32 @@ def _load_all(run):
             return list(pickle.load(fh))
     if src == "atlas_npz":
         from ATLAS.pulsar import PulsarDataLoader
-        paths = sorted(glob.glob(str(Path(resolve_path(run, d["npz_dir"])) / "*.npz")))
-        return [PulsarDataLoader(**np.load(p, allow_pickle=True)) for p in paths]
+        return [PulsarDataLoader(**np.load(p, allow_pickle=True)) for p in _npz_paths(run)]
     raise ConfigError(f"unknown data.source {src!r}")
 
 
+def _npz_paths(run):
+    """The .npz files of an atlas_npz run, in data.pulsars order when the
+    pattern names them with ``{psr}`` (only those files are read)."""
+    d = run["data"]
+    if d.get("npz_files"):
+        pat = resolve_path(run, d["npz_files"])
+        want = d["pulsars"]
+        if "{psr}" in pat and want != "all":
+            excl = set(d["exclude"] or [])
+            return [pat.replace("{psr}", str(n)) for n in want if str(n) not in excl]
+        return sorted(glob.glob(pat.replace("{psr}", "*")))
+    return sorted(glob.glob(str(Path(resolve_path(run, d["npz_dir"])) / "*.npz")))
+
+
 def prepare_data(run):
-    """Load every pulsar of this run's dataset once and cache it (driver side)."""
+    """Load every pulsar of this run's dataset once and cache it (driver side).
+
+    ATLAS .npz files are already fast to read, so they are not cached (a
+    realization sweep would otherwise copy the whole dataset once per run).
+    """
+    if run["data"]["source"] == "atlas_npz":
+        return None
     path = _pulsar_cache(run)
     if not path.exists():
         psrs = _load_all(run)
@@ -135,19 +177,27 @@ def prepare_data(run):
 
 
 def load_pulsars(run):
-    """The pulsars of one run: cached dataset, filtered by pulsars / exclude."""
-    path = _pulsar_cache(run)
-    if not path.exists():
-        prepare_data(run)
-    with open(path, "rb") as fh:
-        psrs = pickle.load(fh)
+    """The pulsars of one run: cached dataset, filtered by pulsars / exclude.
+
+    With an explicit ``data.pulsars`` list the pulsars come back in that order.
+    """
+    if run["data"]["source"] == "atlas_npz":
+        psrs = _load_all(run)
+    else:
+        path = _pulsar_cache(run)
+        if not path.exists():
+            prepare_data(run)
+        with open(path, "rb") as fh:
+            psrs = pickle.load(fh)
     want, excl = run["data"]["pulsars"], set(run["data"]["exclude"] or [])
     names = [str(p.name) for p in psrs]
     if want != "all":
+        want = [str(w) for w in want]
         missing = sorted(set(want) - set(names))
         if missing:
             raise ConfigError(f"data.pulsars not in the dataset: {missing}")
-        psrs = [p for p in psrs if str(p.name) in set(want)]
+        by = {str(p.name): p for p in psrs}
+        psrs = [by[w] for w in want]
     psrs = [p for p in psrs if str(p.name) not in excl]
     if not psrs:
         raise ConfigError("no pulsars left after data.pulsars / data.exclude")
@@ -203,24 +253,132 @@ def chrom_index_for(run, psrs):
     return out
 
 
+def _pick(arr, index):
+    arr = np.asarray(arr)
+    return arr if index is None else arr[index]
+
+
 def load_gtm(run, psrs):
-    """(basis list, gtm_psd or None) from npz files keyed by pulsar name."""
+    """(basis list, gtm_psd or None, mean list or None) for the ``gtm`` block.
+
+    The basis comes from one of
+      basis_file     npz keyed by pulsar name, one [ntoa, k] array each
+      basis_pattern  one .npy per pulsar, path with ``{psr}`` (e.g. Adaptus' U.npy)
+      from_pulsar    PulsarDataLoader.adaptus_basis / adaptus_mean
+    ``index`` picks ``arr[index]`` first (U.npy / mean.npy stored as [1, ...]
+    -> 0), ``size`` keeps the first ``size`` columns.  The mean (mean_pattern
+    or from_pulsar) is subtracted from the residuals by the builder.
+    """
     g = run["model"]["signals"]["gtm"]
     names = [str(p.name) for p in psrs]
-    z = np.load(resolve_path(run, g["basis_file"]))
-    missing = [n for n in names if n not in z.files]
-    if missing:
-        raise ConfigError(f"gtm basis_file has no basis for {missing}")
-    basis = [np.asarray(z[n], float) for n in names]
+    idx, size = g["index"], g["size"]
+    means = None
+    if g["basis_file"]:
+        z = np.load(resolve_path(run, g["basis_file"]))
+        missing = [n for n in names if n not in z.files]
+        if missing:
+            raise ConfigError(f"gtm basis_file has no basis for {missing}")
+        basis = [_pick(z[n], idx) for n in names]
+    elif g["basis_pattern"]:
+        basis = [_pick(np.load(resolve_path(run, g["basis_pattern"].replace("{psr}", n))), idx)
+                 for n in names]
+    elif g["from_pulsar"]:
+        miss = [n for n, p in zip(names, psrs) if getattr(p, "adaptus_basis", None) is None]
+        if miss:
+            raise ConfigError(f"gtm.from_pulsar: no adaptus_basis stored for {miss}")
+        basis = [np.asarray(p.adaptus_basis) for p in psrs]
+        if all(getattr(p, "adaptus_mean", None) is not None for p in psrs):
+            means = [np.asarray(p.adaptus_mean, float).reshape(-1) for p in psrs]
+    else:
+        raise ConfigError("gtm needs basis_file, basis_pattern or from_pulsar")
+    if g["mean_pattern"]:
+        means = [_pick(np.load(resolve_path(run, g["mean_pattern"].replace("{psr}", n))), idx)
+                 .astype(float).reshape(-1) for n in names]
+
+    basis = [np.asarray(b, float) for b in basis]
+    for n, b, p in zip(names, basis, psrs):
+        if b.ndim != 2 or b.shape[0] != len(p.toas):
+            raise ConfigError(f"gtm basis for {n} has shape {b.shape}; expected "
+                              f"({len(p.toas)}, k) -- set model.signals.gtm.index?")
+    if size is not None:
+        short = [n for n, b in zip(names, basis) if b.shape[1] < int(size)]
+        if short:
+            raise ConfigError(f"gtm.size={size} but the basis of {short} has fewer columns")
+        basis = [b[:, :int(size)] for b in basis]
     widths = {b.shape[1] for b in basis}
     if len(widths) != 1:
         raise ConfigError(f"gtm bases must share one width; got {sorted(widths)}")
+    if means is not None:
+        bad = [n for n, m, p in zip(names, means, psrs) if m.size != len(p.toas)]
+        if bad:
+            raise ConfigError(f"gtm mean has the wrong length for {bad}")
+
+    k = widths.pop()
     psd = None
     if g["psd_file"]:
         zp = np.load(resolve_path(run, g["psd_file"]))
         psd = (np.asarray(zp["gtm_psd"], float) if "gtm_psd" in zp.files
                else np.stack([np.asarray(zp[n], float) for n in names], axis=1))
-    return basis, psd
+    elif g["psd_value"] is not None:
+        psd = np.full((k, len(psrs)), float(g["psd_value"]))
+    return basis, psd, means
+
+
+def _array_from_spec(run, spec, what):
+    """A list, ``"file.npz:key"`` / ``"file.npy"``, or ``{file:, key:, index:}``."""
+    if spec is None:
+        return None
+    if isinstance(spec, list):
+        return np.asarray(spec, float)
+    if isinstance(spec, str):
+        f, key = (spec.rsplit(":", 1) + [None])[:2] if ":" in spec else (spec, None)
+        spec = {"file": f, "key": key}
+    f = resolve_path(run, spec["file"])
+    z = np.load(f, allow_pickle=True)
+    if hasattr(z, "files"):
+        if not spec.get("key"):
+            raise ConfigError(f"{what}: {f} is an npz; name the array with 'file.npz:key'")
+        z = z[spec["key"]]
+    return _pick(z, spec.get("index"))
+
+
+def user_freqs(run, which):
+    """frequency_bins.<which>_user_freqs as an array [Hz], or None."""
+    v = _array_from_spec(run, run["frequency_bins"][f"{which}_user_freqs"],
+                         f"frequency_bins.{which}_user_freqs")
+    return None if v is None else np.asarray(v, float).reshape(-1)
+
+
+def timing_params_for(run, psrs):
+    """Per-pulsar list of timing parameters to sample nonlinearly, or None.
+
+    ``params_to_sample`` may be null (every fitted parameter), a list (the
+    same for every pulsar), ``{psr: [...]}``, ``from_pulsar``
+    (PulsarDataLoader.sample_params), or ``{file: x.npz, key: K, index: i}``
+    whose object is ``{psr: [...]}`` (e.g. info.npz SAMPLE_LIST[0]).
+    """
+    spec = run["timing"]["nonlinear"]["params_to_sample"]
+    names = [str(p.name) for p in psrs]
+    if spec is None:
+        return None
+    if spec == "from_pulsar":
+        miss = [n for n, p in zip(names, psrs) if getattr(p, "sample_params", None) is None]
+        if miss:
+            raise ConfigError(f"params_to_sample: from_pulsar, but no sample_params for {miss}")
+        return [[str(x) for x in p.sample_params] for p in psrs]
+    if isinstance(spec, list):
+        return [[str(x) for x in spec] for _ in names]
+    if isinstance(spec, dict) and "file" in spec:
+        obj = _array_from_spec(run, spec, "timing.nonlinear.params_to_sample")
+        if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 0:
+            obj = obj.item()
+        table = {str(k): v for k, v in dict(obj).items()}
+    else:
+        table = {str(k): v for k, v in spec.items()}
+    miss = [n for n in names if n not in table]
+    if miss:
+        raise ConfigError(f"params_to_sample has no entry for {miss}")
+    return [[str(x) for x in np.asarray(table[n]).reshape(-1)] for n in names]
 
 
 # --------------------------------------------------------------------------- #
@@ -300,7 +458,9 @@ def sw_geometry(run, psrs, compute=True):
     """Per-pulsar solar-wind geometry [pc] in each pulsar's TOA order (cached)."""
     method = run["model"]["signals"]["sw"]["geometry"]
     cache = _sw_cache(run, method)
-    files = pulsar_files(run) if run["data"]["par_files"] else {}
+    files = {}
+    if run["data"]["par_files"] and method != "approx":
+        files = pulsar_files(run, [str(p.name) for p in psrs])
     out = []
     for p in psrs:
         f = cache / f"{str(p.name)}.npz"
@@ -346,7 +506,12 @@ def sw_kwargs_for(run, psrs):
     pulsar by the TDSW* lines of its par file (when settings_from_par)."""
     s = run["model"]["signals"]["sw"]
     base = dict(s["defaults"] or {})
-    files = pulsar_files(run) if (s["settings_from_par"] and run["data"]["par_files"]) else {}
+    files = {}
+    if s["settings_from_par"] and run["data"]["par_files"]:
+        try:
+            files = pulsar_files(run, [str(p.name) for p in psrs])
+        except ConfigError as exc:
+            log.warning("TDSW* settings: %s", exc)
     per = []
     for p in psrs:
         kw = dict(base)

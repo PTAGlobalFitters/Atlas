@@ -26,7 +26,7 @@ import yaml
 
 from ATLAS.runner import registry
 
-__all__ = ["DEFAULTS", "SIGNALS", "load_config", "expand_runs", "validate_run",
+__all__ = ["DEFAULTS", "SIGNALS", "load_config", "expand_runs", "validate_run", "substitute_vars",
            "ConfigError", "set_dotted", "get_dotted", "load_priors", "prior_bounds"]
 
 SIGNALS = ("unc", "cor", "dm", "gtm", "chrom", "cquad", "sw", "det")
@@ -36,6 +36,8 @@ _BLOCK_ORDER = ("dm", "gtm", "chrom", "cquad", "sw", "det")
 
 DEFAULTS = {
     "config_version": 1,
+    # free-form values substituted into any string as ${name} (after overrides)
+    "vars": {},
     "ray": {
         "address": None,
         "num_cpus_per_run": 1,
@@ -48,7 +50,7 @@ DEFAULTS = {
         "root": None,
         "run_dir": "{root}/{run_name}",
         "format": "npz",
-        "save": {"samples": True, "red_coefficients": False,
+        "save": {"samples": True, "red_coefficients": False, "z_a": False,
                  "resolved_config": True, "environment": True},
         "skip_completed": True,
         "overwrite": False,
@@ -59,6 +61,7 @@ DEFAULTS = {
         "tim_files": None,
         "pickle": None,
         "npz_dir": None,
+        "npz_files": None,
         "pulsars": "all",
         "exclude": [],
         "timing_package": "pint",
@@ -68,6 +71,7 @@ DEFAULTS = {
         "dm_ref_freq": 1400.0,
         "cache_dir": None,
         "load_jobs": 4,
+        "file_exclude": [],
     },
     "timing": {
         "linear_timing": True,
@@ -79,6 +83,8 @@ DEFAULTS = {
     "frequency_bins": {
         "num_irn_bins": 30, "num_gwb_bins": 14, "num_dm_bins": 30,
         "num_chrom_bins": 30, "num_det_bins": None, "use_pulsar_tspan": False,
+        "irn_user_freqs": None, "gwb_user_freqs": None,
+        "dm_user_freqs": None, "chrom_user_freqs": None,
     },
     "model": {
         "basis_string": "unc+cor->unc ; dm",
@@ -93,12 +99,16 @@ DEFAULTS = {
             "sw": {"geometry": "pint", "settings_from_par": True,
                    "defaults": {"kernel": "RIDGE", "dt_days": 30.0, "interp_kind": "linear"},
                    "fixed_log10_sigma": None, "priors": "sw_ridge"},
-            "gtm": {"basis_file": None, "psd_file": None},
+            "gtm": {"basis_file": None, "basis_pattern": None, "mean_pattern": None,
+                    "from_pulsar": False, "index": None, "size": None,
+                    "psd_file": None, "psd_value": None},
             "det": {"waveform": "cw_delay_evolve_float64", "priors": "cw"},
         },
     },
     "sampler": {
         "kind": "nuts",
+        "model": "atlas",
+        "seed_offset_var": None,
         "marg_over_non_gwb": False,
         "nuts": {"target_accept_prob": 0.8, "max_tree_depth": 10, "dense_mass": False},
         "num_warmup": 500,
@@ -112,7 +122,8 @@ DEFAULTS = {
 }
 
 # dicts whose keys are free-form (not checked against DEFAULTS)
-_FREE_FORM = ("ray.env_vars", "model.signals.*.fixed", "model.signals.sw.defaults")
+_FREE_FORM = ("vars", "ray.env_vars", "model.signals.*.fixed", "model.signals.sw.defaults",
+              "timing.nonlinear.params_to_sample")
 
 
 class ConfigError(ValueError):
@@ -200,6 +211,54 @@ def load_config(path):
     return cfg
 
 
+_VAR = __import__("re").compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def substitute_vars(obj, variables, _what="config"):
+    """Replace ``${name}`` in every string of ``obj`` by ``variables[name]``.
+
+    A string that is exactly ``${name}`` takes the value itself (so numbers and
+    lists stay numbers and lists); otherwise the value is formatted into the
+    string.  Values may refer to other variables.
+    """
+    def sub(v):
+        if isinstance(v, dict):
+            return {k: sub(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [sub(x) for x in v]
+        if not isinstance(v, str) or "${" not in v:
+            return v
+        for _ in range(10):
+            m = _VAR.fullmatch(v)
+            if m:
+                if m.group(1) not in variables:
+                    raise ConfigError(f"{_what}: unknown variable ${{{m.group(1)}}}")
+                v = copy.deepcopy(variables[m.group(1)])
+                if not (isinstance(v, str) and "${" in v):
+                    return sub(v) if isinstance(v, (dict, list)) else v
+                continue
+            missing = [n for n in _VAR.findall(v) if n not in variables]
+            if missing:
+                raise ConfigError(f"{_what}: unknown variable(s) {missing} in {v!r}; "
+                                  f"defined: {sorted(variables)}")
+            v = _VAR.sub(lambda mm: str(variables[mm.group(1)]), v)
+            if "${" not in v:
+                return v
+        raise ConfigError(f"{_what}: variables refer to each other in a loop: {v!r}")
+    return sub(obj)
+
+
+def _grid_values(key, vals):
+    """A grid entry: a list, or ``{range: [start, stop(, step)]}``."""
+    if isinstance(vals, dict):
+        if set(vals) != {"range"}:
+            raise ConfigError(f"sweep grid {key!r}: a dict entry must be {{range: [start, stop]}}")
+        return list(range(*[int(x) for x in vals["range"]]))
+    if not isinstance(vals, list) or not vals:
+        raise ConfigError(f"sweep grid {key!r}: give a non-empty list or {{range: [start, stop]}}")
+    return vals
+
+
 def _fmt(v):
     if isinstance(v, float):
         return f"{v:g}"
@@ -219,6 +278,8 @@ def expand_runs(cfg):
     for r in cfg["runs"]:
         if "name" not in r:
             raise ConfigError(f"every run needs a name: {r}")
+        if "sweep" in r:
+            raise ConfigError(f"run {r['name']!r}: put sweeps under the top-level 'sweeps:'")
         extra = set(r) - {"name", "overrides"}
         if extra:
             raise ConfigError(f"run {r['name']!r}: unknown keys {sorted(extra)} "
@@ -229,7 +290,7 @@ def expand_runs(cfg):
         if not name or not grid:
             raise ConfigError(f"a sweep needs 'name' and 'grid': {sw}")
         keys = list(grid)
-        for combo in itertools.product(*[grid[k] for k in keys]):
+        for combo in itertools.product(*[_grid_values(k, grid[k]) for k in keys]):
             ov = dict(sw.get("base_overrides") or {})
             ov.update(zip(keys, combo))
             tag = "__".join(f"{k.split('.')[-1]}={_fmt(v)}" for k, v in zip(keys, combo))
@@ -245,8 +306,21 @@ def expand_runs(cfg):
         run = copy.deepcopy(base)
         for path, value in overrides.items():
             set_dotted(run, path, value)
+        variables = dict(run["vars"] or {}, run_name=name, run_index=i)
+        run["vars"] = substitute_vars(run["vars"] or {}, variables, f"run {name!r} vars")
+        variables.update(run["vars"])
+        run = {k: (v if k in ("vars", "_config_path", "_config_dir")
+                   else substitute_vars(v, variables, f"run {name!r}"))
+               for k, v in run.items()}
         if "sampler.seed" not in overrides:
-            run["sampler"]["seed"] = int(base["sampler"]["seed"]) + i
+            off_var = run["sampler"]["seed_offset_var"]
+            if off_var is not None:
+                if off_var not in variables:
+                    raise ConfigError(f"run {name!r}: sampler.seed_offset_var {off_var!r} "
+                                      "is not a variable")
+                run["sampler"]["seed"] = int(run["sampler"]["seed"]) + int(variables[off_var])
+            else:
+                run["sampler"]["seed"] = int(run["sampler"]["seed"]) + i
         root = run["output"]["root"]
         if root is None:
             raise ConfigError("output.root is required")
@@ -395,10 +469,25 @@ def validate_run(run, check_files=True):
         if not (run["white_noise"]["vary"] or tm["nonlinear"]["enabled"]):
             errs.append("model.signals.dm.varied_index needs white_noise.vary or "
                         "timing.nonlinear.enabled (the helpers must be rebuilt per step)")
+    custom = smp["model"] != "atlas"
+    if custom and (not isinstance(smp["model"], str) or ":" not in smp["model"]):
+        errs.append("sampler.model must be 'atlas' or 'path/to/file.py:function'")
     if sig["chrom"]["varied_index"] and not ({"chrom", "cquad"} & set(present)):
         errs.append("model.signals.chrom.varied_index needs 'chrom' or 'cquad' in basis_string")
     if tm["nonlinear"]["enabled"] and importlib.util.find_spec("jug") is None:
         errs.append("timing.nonlinear.enabled needs JUG installed")
+    if tm["nonlinear"]["enabled"] and not run["data"]["par_files"]:
+        errs.append("timing.nonlinear.enabled needs data.par_files / data.tim_files "
+                    "(JUG reads them, whatever data.source is)")
+    pts = tm["nonlinear"]["params_to_sample"]
+    if not (pts is None or pts == "from_pulsar" or isinstance(pts, (list, dict))):
+        errs.append("timing.nonlinear.params_to_sample must be null, 'from_pulsar', a list, "
+                    "{psr: [...]}, or {file: ..., key: ..., index: ...}")
+    for k in ("irn_user_freqs", "gwb_user_freqs", "dm_user_freqs", "chrom_user_freqs"):
+        v = fb[k]
+        if not (v is None or isinstance(v, (list, str, dict))):
+            errs.append(f"frequency_bins.{k} must be null, a list, 'file.npz:key' or "
+                        "{file: ..., key: ...}")
     if run["output"]["format"] not in ("npz", "netcdf"):
         errs.append("output.format must be npz or netcdf")
     if run["output"]["format"] == "netcdf" and netcdf_engine() is None:
@@ -458,8 +547,13 @@ def validate_run(run, check_files=True):
             errs.append(f"signal 'det': {exc}")
         if run["data"]["pulsar_distances"] is None:
             errs.append("a 'det' signal needs data.pulsar_distances")
-    if "gtm" in present and not sig["gtm"]["basis_file"]:
-        errs.append("a 'gtm' signal needs model.signals.gtm.basis_file")
+    g = sig["gtm"]
+    n_src = sum(bool(x) for x in (g["basis_file"], g["basis_pattern"], g["from_pulsar"]))
+    if "gtm" in present and n_src != 1:
+        errs.append("a 'gtm' signal needs exactly one of model.signals.gtm.basis_file, "
+                    "basis_pattern or from_pulsar")
+    if g["psd_file"] and g["psd_value"] is not None:
+        errs.append("model.signals.gtm: give psd_file or psd_value, not both")
 
     # -- files --------------------------------------------------------------------
     if check_files:
@@ -475,8 +569,23 @@ def validate_run(run, check_files=True):
             if not d["pickle"] or not Path(_resolve(run, d["pickle"])).exists():
                 errs.append(f"data.pickle not found: {d['pickle']}")
         elif src == "atlas_npz":
-            if not d["npz_dir"] or not Path(_resolve(run, d["npz_dir"])).is_dir():
-                errs.append(f"data.npz_dir not found: {d['npz_dir']}")
+            if d["npz_files"]:
+                pat = _resolve(run, d["npz_files"])
+                pulsars = d["pulsars"] if d["pulsars"] != "all" else None
+                if "{psr}" in pat and pulsars:
+                    miss = [pat.replace("{psr}", n) for n in pulsars
+                            if not Path(pat.replace("{psr}", n)).exists()]
+                    if miss:
+                        errs.append(f"data.npz_files: {len(miss)} file(s) missing, e.g. {miss[:3]}")
+                elif not glob.glob(pat.replace("{psr}", "*")):
+                    errs.append(f"data.npz_files matched nothing: {d['npz_files']}")
+            elif not d["npz_dir"] or not Path(_resolve(run, d["npz_dir"])).is_dir():
+                errs.append(f"data.npz_dir not found: {d['npz_dir']} (or set data.npz_files)")
+            if tm["nonlinear"]["enabled"]:
+                pars, tims = _files(d["par_files"], run), _files(d["tim_files"], run)
+                if not pars or not all(Path(p).exists() for p in pars) or \
+                        not tims or not all(Path(t).exists() for t in tims):
+                    errs.append("nonlinear timing: data.par_files / data.tim_files matched nothing")
         else:
             errs.append("data.source must be par_tim | enterprise_pickle | atlas_npz")
         for key in ("noise_dict", "pulsar_distances"):
@@ -493,6 +602,23 @@ def validate_run(run, check_files=True):
             f = sig["gtm"][key]
             if "gtm" in present and f and not Path(_resolve(run, f)).exists():
                 errs.append(f"model.signals.gtm.{key} not found: {f}")
+        if "gtm" in present and g["basis_pattern"] and d["pulsars"] != "all":
+            for key in ("basis_pattern", "mean_pattern"):
+                pat = g[key]
+                if pat:
+                    miss = [n for n in d["pulsars"]
+                            if not Path(_resolve(run, pat.replace("{psr}", n))).exists()]
+                    if miss:
+                        errs.append(f"model.signals.gtm.{key}: no file for {miss[:5]}")
+        if custom:
+            f = smp["model"].rsplit(":", 1)[0]
+            if not Path(_resolve(run, f)).exists():
+                errs.append(f"sampler.model file not found: {f}")
+        for k in ("irn_user_freqs", "gwb_user_freqs", "dm_user_freqs", "chrom_user_freqs"):
+            v = fb[k]
+            f = v.get("file") if isinstance(v, dict) else (v.rsplit(":", 1)[0] if isinstance(v, str) else None)
+            if f and not Path(_resolve(run, f)).exists():
+                errs.append(f"frequency_bins.{k}: file not found: {f}")
 
     if errs:
         raise ConfigError(f"run {name!r} cannot run:\n" + "\n".join(f"  - {e}" for e in errs))
