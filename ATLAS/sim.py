@@ -278,7 +278,7 @@ class Sim(object):
             ####################################White Noise####################################
             if self.has_white:
                 Nmat = self.white_noise_model.cov_matrices[pidx]
-                stop_wn_index = start_wn_index + Nmat.n_backends * 3
+                stop_wn_index = start_wn_index + Nmat.n_params   # 2 or 3 per backend (ECORR optional)
                 rand_white = jar.normal(self.rngkeys[pidx], shape=(Nmat.ntoas, 1))
                 white_helper = Nmat.get_nvec_jvec(
                     white_params[start_wn_index:stop_wn_index]
