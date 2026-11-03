@@ -99,8 +99,7 @@ def _model_and_args(run, b):
                  varied_chrom_gp_index=chrom_idx,
                  chrom_gp_index_bounds=tuple(float(x) for x in sig["chrom"]["index_bounds"]),
                  tm_direct_sampling_type=run["timing"]["nonlinear"]["parametrization"])
-    import jax.numpy as jnp
-    args = dict(raw_residuals=jnp.concat(b.data.raw_residuals))
+    args = dict(raw_residuals=b.residuals)
     basis_moves = chrom_idx or dm_idx or vary_white or b.tm_model is not None
     if vary_white:
         args.update(wn_lower_bound=b.wn_lower, wn_upper_bound=b.wn_upper)
@@ -121,6 +120,23 @@ def _model_and_args(run, b):
     if basis_moves:
         args["red_noise_basis"] = b.rn.get_Fmat_concat
     return partial(model_maker, **bound), args
+
+
+def _custom_model(run, b):
+    """``sampler.model: path/to/file.py:function`` -> ``function(run, built)``,
+    which returns ``(model, kwargs)`` for ``MCMC.run``.  The run's variables
+    are in ``run['vars']``."""
+    import importlib.util
+    from ATLAS.runner.config import resolve_path
+    f, fn = run["sampler"]["model"].rsplit(":", 1)
+    path = resolve_path(run, f)
+    spec = importlib.util.spec_from_file_location(f"atlas_custom_{abs(hash(path))}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, fn):
+        raise AttributeError(f"{path} has no function {fn!r}")
+    model, args = getattr(mod, fn)(run, b)
+    return model, dict(args or {})
 
 
 def _named(samples, b):
@@ -212,20 +228,22 @@ def run_one(run, prebuilt=None):
         import jax.random as jr
         from numpyro.infer import MCMC, NUTS
         smp = run["sampler"]
-        model, args = _model_and_args(run, b)
+        custom = smp["model"] != "atlas"
+        model, args = _custom_model(run, b) if custom else _model_and_args(run, b)
         mcmc = MCMC(NUTS(model, **smp["nuts"]),
                     num_warmup=int(smp["num_warmup"]), num_samples=int(smp["num_samples"]),
                     num_chains=int(smp["num_chains"]), thinning=int(smp["thinning"]),
                     chain_method=smp["chain_method"], progress_bar=bool(smp["progress_bar"]),
-                    jit_model_args=True)
-        keep_coeff = run["output"]["save"]["red_coefficients"]
+                    jit_model_args=not custom)
+        keep_za = bool(run["output"]["save"]["z_a"])
         mcmc.run(jr.key(int(smp["seed"])),
-                 extra_fields=("diverging",) if keep_coeff else ("diverging", "~z.z_a"),
+                 extra_fields=(("diverging",) if (keep_za or custom)
+                               else ("diverging", "~z.z_a")),
                  **args)
         t_sample = time.time()
 
         samples = mcmc.get_samples(group_by_chain=True)
-        if not keep_coeff:
+        if not keep_za:
             samples = {k: v for k, v in samples.items() if k != "z_a"}
         diverging = np.asarray(mcmc.get_extra_fields(group_by_chain=True)["diverging"])
         names = _named(samples, b)

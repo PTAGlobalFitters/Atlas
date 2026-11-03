@@ -27,6 +27,13 @@ class Built:
     wn_upper: object
     present: tuple
     psr_names: list
+    residual_offset: object = None   # subtracted from the residuals (GTM/Adaptus mean)
+
+    @property
+    def residuals(self):
+        """The residuals the likelihood sees: raw minus ``residual_offset``."""
+        r = jnp.concat(self.data.raw_residuals)
+        return r if self.residual_offset is None else r - self.residual_offset
 
 
 def _bins(fb, key, present, sig):
@@ -67,16 +74,13 @@ def build_model(run, parsed, resolved):
     names = [str(p.name) for p in psrs]
     noise_dict = data_io.load_noise_dict(run)
 
-    adaptus_basis = gtm_psd = None
+    adaptus_basis = gtm_psd = gtm_means = None
     if "gtm" in present:
-        adaptus_basis, gtm_psd = data_io.load_gtm(run, psrs)
+        adaptus_basis, gtm_psd, gtm_means = data_io.load_gtm(run, psrs)
 
     parfiles = timfiles = None
     if tm_cfg["nonlinear"]["enabled"]:
-        files = data_io.pulsar_files(run)
-        missing = [n for n in names if n not in files]
-        if missing:
-            raise ConfigError(f"nonlinear timing needs par/tim files for {missing}")
+        files = data_io.pulsar_files(run, names)
         parfiles = [files[n][0] for n in names]
         timfiles = [files[n][1] for n in names]
 
@@ -105,6 +109,10 @@ def build_model(run, parsed, resolved):
     wn_vec = wn.params_dict_to_vector(noise_dict) if noise_dict is not None else None
 
     kw = dict(use_pulsar_tspan=bool(fb["use_pulsar_tspan"]))
+    for which in ("irn", "gwb", "dm", "chrom"):
+        uf = data_io.user_freqs(run, which)
+        if uf is not None:
+            kw[f"{which}_user_freqs"] = jnp.asarray(uf)
 
     def psd_of(s):
         r = resolved[s]
@@ -151,8 +159,15 @@ def build_model(run, parsed, resolved):
     tm_model = None
     if tm_cfg["nonlinear"]["enabled"]:
         tm_model = mb.make_timing_model(
-            explicit_timing_model_params_to_sample=tm_cfg["nonlinear"]["params_to_sample"])
+            explicit_timing_model_params_to_sample=data_io.timing_params_for(run, psrs))
 
     log.info("built %s: %d pulsars, %d T-matrix columns, %d red-noise parameters",
              run["run"]["name"], len(psrs), rn.nmodes, rn.model.upper_prior_lim_all.shape[0])
-    return Built(data, wn, rn, tm_model, wn_vec, wn_lower, wn_upper, present, names)
+    offset = None
+    if gtm_means is not None:
+        if tm_model is not None:
+            raise ConfigError("a gtm mean is subtracted from the data residuals, but with "
+                              "nonlinear timing the residuals come from the timing model; "
+                              "drop mean_pattern or the nonlinear timing")
+        offset = jnp.asarray(np.concatenate(gtm_means))
+    return Built(data, wn, rn, tm_model, wn_vec, wn_lower, wn_upper, present, names, offset)

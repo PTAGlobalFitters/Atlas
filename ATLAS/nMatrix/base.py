@@ -435,7 +435,8 @@ class SinglePulsarWhiteCov:
 
         Returns
         -------
-        wn_vec : jnp.ndarray [3 * nbackends]
+        wn_vec : jnp.ndarray [n_params]  (n_params = 3 * nbackends, or 2 * nbackends
+            without ECORR)
         """
         names = self.get_param_names()
         v = jnp.array([params[n] for n in names])
@@ -486,8 +487,8 @@ class SinglePulsarWhiteCov:
         Returns
         -------
         jnp.ndarray
-            White-noise parameter vector of shape
-            ``[3 * n_backends]``.
+            White-noise parameter vector of shape ``[n_params]``
+            (``3 * n_backends``, or ``2 * n_backends`` without ECORR).
         """
         ef, eq, ec = [], [], []
         for b in self.backends:   # same iteration order as params_dict_to_vector
@@ -572,10 +573,9 @@ class SinglePulsarWhiteCov:
         Parameters
         ----------
         wn_vec : jnp.ndarray
-            White-noise parameter vector of shape
-            ``[3 * n_backends]`` with layout
+            White-noise parameter vector of shape ``[n_params]`` with layout
 
-                [EFACs | log10_t2equads | log10_ecorrs].
+                [EFACs | log10_t2equads | log10_ecorrs (if include_ecorr)].
 
         Returns
         -------
@@ -1011,7 +1011,7 @@ class WhiteCov:
 
         Returns
         -------
-        wn_vec : jnp.ndarray [npulsars * 3 * max_nbackends]
+        wn_vec : jnp.ndarray [sum_p n_params_p]
             Concatenation of each per-pulsar params_dict_to_vector output.
         """
         return jnp.concatenate([cov.params_dict_to_vector(params)
@@ -1031,7 +1031,7 @@ class WhiteCov:
 
         Returns
         -------
-        wn_vec : jnp.ndarray [sum_p(3 * nbackends_p)]
+        wn_vec : jnp.ndarray [sum_p n_params_p]
         """
         return jnp.concatenate([cov.prior_draw(uniform_efac = uniform_efac) for cov in self.cov_matrices])
 
@@ -1048,7 +1048,7 @@ class WhiteCov:
 
         Returns
         -------
-        wn_vec : jnp.ndarray [sum_p(3 * nbackends_p)]
+        wn_vec : jnp.ndarray [sum_p n_params_p]
         """
         names = self.get_param_names()
         if np.any(param_values):
@@ -1070,7 +1070,7 @@ class WhiteCov:
 
         Returns
         -------
-        wn_vec : jnp.ndarray [sum_p(3 * nbackends_p)]
+        wn_vec : jnp.ndarray [sum_p n_params_p]
         """
         return list(itertools.chain.from_iterable([cov.get_param_names() for cov in self.cov_matrices]))
 

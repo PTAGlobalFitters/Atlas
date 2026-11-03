@@ -8,6 +8,13 @@
 # ====================================================================== #
 config_version: 1
 
+# Free-form values, substituted into any string as ${name} after overrides
+# and sweeps.  "${x}" alone keeps the value's type (numbers, lists).
+# ${run_name} and ${run_index} are always defined.
+vars: {}
+#  realization: 0
+#  sim_dir: /path/to/SIM
+
 ray:
   address: null              # null = start Ray locally; "auto" = join a running cluster
   num_cpus_per_run: 4
@@ -24,7 +31,8 @@ output:
   format: npz                # npz | netcdf (ArviZ layout; needs xarray + netCDF4, or h5netcdf + h5py)
   save:
     samples: true
-    red_coefficients: false  # store the reparameterised coefficients z_a (large)
+    red_coefficients: false  # store the red-noise coefficients 'coeff' (large)
+    z_a: false               # store the sampler's unit-normal coordinates z_a (large)
     resolved_config: true
     environment: true
   skip_completed: true       # resume: runs with status 'done' are skipped
@@ -35,7 +43,9 @@ data:
   par_files: /path/to/NG20/*.par
   tim_files: /path/to/NG20/*.tim
   pickle: null               # source = enterprise_pickle: a pickled list of Pulsars
-  npz_dir: null              # source = atlas_npz
+  npz_dir: null              # source = atlas_npz: every *.npz in this folder
+  npz_files: null            # source = atlas_npz: glob, or a pattern with {psr} filled
+                             #   from data.pulsars (only those files are read)
   pulsars: all               # all | [J1909-3744, J1713+0747]
   exclude: []
   timing_package: pint       # pint | tempo2
@@ -45,6 +55,7 @@ data:
   dm_ref_freq: 1400          # MHz; also the reference of chrom / cquad
   cache_dir: ./atlas_cache   # pulsars and solar-wind geometry, computed once
   load_jobs: 8               # parallel par/tim loading
+  file_exclude: []           # skip par/tim files whose name contains any of these, e.g. [ao, gbt]
 
 timing:
   linear_timing: true
@@ -52,7 +63,10 @@ timing:
   nonlinear:                 # sample the timing model with JUG
     enabled: false
     params_to_sample: null   # null = every fitted parameter in the par files
-    parametrization: klam
+                             # | [F0, F1]  (same for every pulsar) | {psr: [...]}
+                             # | from_pulsar  (PulsarDataLoader.sample_params)
+                             # | {file: info.npz, key: SAMPLE_LIST, index: 0}  -> {psr: [...]}
+    parametrization: klam    # klam | simple (bounded per-parameter priors)
 
 white_noise:
   vary: false                # false = fixed at data.noise_dict
@@ -66,6 +80,12 @@ frequency_bins:
   num_chrom_bins: 30
   num_det_bins: null
   use_pulsar_tspan: false
+  # Explicit frequency grids [Hz]; override the bin count of that signal.
+  # A list, "file.npz:key", "file.npy", or {file: ..., key: ..., index: ...}.
+  irn_user_freqs: null
+  gwb_user_freqs: null
+  dm_user_freqs: null
+  chrom_user_freqs: null
 
 model:
   basis_string: "unc+cor->unc ; dm, chrom, cquad, sw"
@@ -98,15 +118,23 @@ model:
       defaults: {kernel: RIDGE, dt_days: 30.0, interp_kind: linear}
       fixed_log10_sigma: null
       priors: sw_ridge
-    gtm:
-      basis_file: null       # npz, one [ntoa, k] array per pulsar name
-      psd_file: null         # npz with 'gtm_psd' [k, npsr]; null = unit variance
+    gtm:                     # one basis source:
+      basis_file: null       #   npz, one [ntoa, k] array per pulsar name
+      basis_pattern: null    #   one .npy per pulsar, e.g. /adaptus/{psr}/U.npy
+      from_pulsar: false     #   PulsarDataLoader.adaptus_basis / adaptus_mean
+      mean_pattern: null     # e.g. /adaptus/{psr}/mean.npy; subtracted from the residuals
+      index: null            # take arr[index] first (U.npy stored as [1, ntoa, k] -> 0)
+      size: null             # keep the first `size` columns
+      psd_file: null         # npz with 'gtm_psd' [k, npsr]
+      psd_value: null        # or one fixed variance for every column; both null = unit
     det:
       waveform: cw_delay_evolve_float64
       priors: cw
 
 sampler:
   kind: nuts
+  model: atlas               # atlas | path/to/file.py:function  (custom: function(run, built)
+                             #   returns (numpyro_model, kwargs for mcmc.run))
   marg_over_non_gwb: false   # true: keep only the GWB coefficients (needs `cor`)
   nuts: {target_accept_prob: 0.8, max_tree_depth: 10, dense_mass: false}
   num_warmup: 500
@@ -115,6 +143,7 @@ sampler:
   chain_method: sequential   # sequential | vectorized | parallel
   thinning: 1
   seed: 170817               # run i uses seed + i unless it overrides sampler.seed
+  seed_offset_var: null      # or a variable name: seed + vars[name] (e.g. realization)
   progress_bar: false
 
 runs:
@@ -131,3 +160,7 @@ sweeps: []
 #  - name: chi_scan
 #    grid:
 #      model.signals.chrom.chrom_index: [3.0, 4.0, 4.4]
+#  - name: realizations
+#    base_overrides: {model.basis_string: "cor+unc->unc"}
+#    grid:
+#      vars.realization: {range: [0, 100]}     # 0, 1, ..., 99
