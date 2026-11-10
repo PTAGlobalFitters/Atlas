@@ -369,6 +369,73 @@ def test_separate_cor_block():
     m.rn.lnposterior_reparam(m.helpers, m.red_params(), z)
 
 
+@pytest.mark.parametrize("layout", [
+    pytest.param(dict(model_string="ltm|unc+cor->unc", linear_timing=True), id="nested"),
+    pytest.param(dict(model_string="ltm|unc;cor", linear_timing=True), id="separate"),
+    pytest.param(dict(model_string="unc;cor", linear_timing=False), id="separate-no-ltm"),
+])
+def test_partial_marg_gwb_block_matches_reference(layout):
+    '''
+
+    The dense GWB block that `partial_marg` keeps (`partial_reparm_helper`)
+    equals the independent reference: per bin, phi_G = S_k * Gamma with the HD
+    ORF, inverted and repeated over the sin/cos quadratures, and
+    logdet = 2 * sum_k log|S_k Gamma|. Regression: the off-diagonal ORF terms
+    were scattered with absolute bin indices, which point past the end of the
+    GWB-only array when 'cor' is a separate basis block, so they were silently
+    dropped and `partial_marg` became CURN.
+
+    Arguments
+    ------------------------------
+    layout : dict
+    	`harness.build` keyword arguments for the model-string layout.
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    npsr = 3
+    m = H.build(npsr=npsr, orf_name="hd", **layout)
+    red = m.red_params()
+    phiinv_G, logdet_G, _, _ = m.rn.model.partial_reparm_helper(red, m.rn._pad_mask)
+
+    # reference GWB covariance per bin: S_k * Gamma (Gamma has a unit diagonal)
+    _, _, gwb = H.psd_pieces(m, red)
+    gamma = H.orf_matrix(m)
+    phi_G = gwb[:, None, None] * gamma[None]
+    expected_inv = np.repeat(np.linalg.inv(phi_G), 2, axis=0)
+    expected_logdet = 2 * np.sum(np.linalg.slogdet(phi_G)[1])
+
+    assert np.allclose(np.asarray(phiinv_G), expected_inv, rtol=TIGHT, atol=0)
+    assert abs(float(logdet_G) - expected_logdet) / abs(expected_logdet) < TIGHT
+
+
+def test_partial_marg_separate_block_uses_the_orf():
+    '''
+
+    End to end, `partial_marg_lnposterior` on a separate 'cor' block must
+    depend on the ORF: the HD and zero-ORF models give different densities at
+    the same point. Before the local-index fix they were identical, because
+    the HD cross terms were dropped.
+
+    Arguments
+    ------------------------------
+    None
+
+    Returns
+    ------------------------------
+    None
+
+    '''
+    z = jnp.asarray(np.random.default_rng(0).normal(size=(3, 2 * 4)))
+    values = {}
+    for orf_name in ("hd", "zero"):
+        m = H.build(npsr=3, model_string="ltm|unc;cor", orf_name=orf_name)
+        values[orf_name] = float(m.rn.partial_marg_lnposterior(m.helpers, m.red_params(), z)[0])
+    assert abs(values["hd"] - values["zero"]) > 1e-6 * abs(values["zero"])
+
+
 def test_dm_model_string_builds_and_evaluates():
     """B1 regression: a model string containing `dm` used to be unreachable,
     because PTA_Data stored `self.dm_bins` while make_red_noise read
