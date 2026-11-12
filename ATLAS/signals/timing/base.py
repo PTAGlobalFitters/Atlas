@@ -386,7 +386,20 @@ _GIBBS_BOUND_SUPPORTED = ("M2", "SINI", "ECC")
 DEFAULT_BOUND = _GIBBS_BOUND_SUPPORTED
 
 
-def sample_timing_theta(sample_list, theta_0, sigma, prefix='', affine_z_sd=100.0):
+# Physical domain of each bounded param, used when perturb_bounded=True.
+# Matches the clips in sample_timing_theta_batched: M2 and PX are bounded below
+# only, SINI and ECC on both sides.
+_PERTURB_DOMAIN = {
+    'SINI': (1e-6, 1.0),
+    'ECC':  (0.0, _ECC_HI),
+    'M2':   (1e-12, None),
+    'PX':   (1e-12, None),
+}
+
+
+def sample_timing_theta(sample_list, theta_0, sigma, prefix='', affine_z_sd=100.0,
+                        affine_z_sd_bounded = None,
+                        perturb_bounded=False):
     """numpyro: draw each sampled timing param from its proper bounded prior.
 
     THE single prior mechanism — called by both the production MultiPsrTimingModel
@@ -401,10 +414,43 @@ def sample_timing_theta(sample_list, theta_0, sigma, prefix='', affine_z_sd=100.
     sigma       : dict          JUG formal σ per param (affine scale = aux['sigJUG'])
     prefix      : str           name prefix (e.g. per-pulsar 'p0_') to avoid clashes
     affine_z_sd : float         SD of the unit-scale Normal prior on z
+    perturb_bounded : bool, default False
+        False: SINI/ECC/M2/PX are drawn from their full bounded priors
+        (cos i ~ U(-1,1), ECC ~ U(0,1), M2 ~ U(*_M2_BOUNDS), PX ~ U(*_PX_BOUNDS)),
+        ignoring ``affine_z_sd``.  This is the production prior.
+        True: they are perturbed around ``theta_0`` by ``affine_z_sd * sigma[k]``
+        like the affine branch, matching ``sample_timing_theta_batched``.  Use it
+        for a controlled N-sigma displacement rather than a prior-predictive draw.
+
+        The perturbation is a TruncatedNormal in the z coordinate rather than a
+        Normal clipped to the domain.  Clipping (what the batched version does,
+        where it is only ever used to generate draws) would give NUTS a flat
+        region with zero gradient outside the bounds and pile posterior mass on
+        the boundary; the truncated distribution has the same support with a
+        correct normalisation and a live gradient everywhere inside it.
     """
+    _PERTURB_DOMAIN = {
+    'SINI': (1e-6, 1.0),
+    'ECC':  (0.0, _ECC_HI),
+    'M2':   (1e-12, None),
+    'PX':   (1e-12, None),
+                        }
     theta = {}
     for k in sample_list:
-        if k == 'SINI':
+        if perturb_bounded and k in _PERTURB_DOMAIN:
+            # Affine perturbation, but confined to the physical domain.  The
+            # site stays `z_{k}` so the name matches both the affine branch and
+            # sample_timing_theta_batched.
+            s = max(float(sigma[k]), 1e-30)
+            lo, hi = _PERTURB_DOMAIN[k]
+            z_lo = (lo - theta_0[k]) / s if lo is not None else None
+            z_hi = (hi - theta_0[k]) / s if hi is not None else None
+            z = numpyro.sample(
+                f'{prefix}z_{k}',
+                dist.TruncatedNormal(0.0, affine_z_sd_bounded, low=z_lo, high=z_hi))
+            theta[k] = theta_0[k] + z * s
+            numpyro.deterministic(f'{prefix}{k}', theta[k])
+        elif k == 'SINI':
             cosi = numpyro.sample(f'{prefix}cosi_{k}', dist.Uniform(-1.0, 1.0))
             theta[k] = jnp.sqrt(jnp.clip(1.0 - cosi ** 2, 1e-12, 1.0))
             numpyro.deterministic(f'{prefix}{k}', theta[k])   # transformed → emit
@@ -423,20 +469,31 @@ def sample_timing_theta(sample_list, theta_0, sigma, prefix='', affine_z_sd=100.
 
 
 def sample_timing_theta_batched(key, sample_list, theta_0, sigma, num_samples,
-                                prefix='', affine_z_sd=100.0):
-    """Pure-JAX batched draw mirroring sample_timing_theta's prior logic.
-
-    ``theta_0`` / ``sigma`` are dicts of python floats or 0-d arrays.
-
-    Returns ``{site_name: array of shape (num_samples,)}``, containing BOTH the
-    physical params (``f'{prefix}{k}'``) and the underlying sampler coordinates
-    (``f'{prefix}z_{k}'`` / ``f'{prefix}cosi_{k}'``).  Callers that feed this
-    into ``delta_m_us`` must select only the physical param names.
+                                prefix='', affine_z_sd=100.0, affine_z_sd_bounded = 1,
+                                perturb_bounded=False,
+                                override = None):
+    """...
+    perturb_bounded : bool
+        False (default): SINI/ECC/M2/PX are drawn from their full bounded
+        priors, ignoring affine_z_sd.  Correct for prior-predictive training
+        sets (the PCA basis in GaussianTiming), wrong for a 1-sigma injection.
+        True: they are perturbed around theta_0 by affine_z_sd * sigJUG[k],
+        matching the affine branch.
     """
     keys = jrandom.split(key, len(sample_list))
     theta = {}
     for k, subkey in zip(sample_list, keys):
-        if k == 'SINI':
+        if k in ('SINI', 'ECC', 'M2', 'PX') and perturb_bounded:
+            s = max(float(sigma[k]), 1e-30)
+            z = jrandom.normal(subkey, (num_samples,)) * affine_z_sd_bounded
+            val = theta_0[k] + z * s
+            # clip into the physical domain
+            if k == 'SINI':  val = jnp.clip(val, 1e-6, 1.0)
+            elif k == 'ECC': val = jnp.clip(val, 0.0, _ECC_HI)
+            else:            val = jnp.clip(val, 1e-12, None)
+            theta[f'{prefix}z_{k}'] = z
+            theta[f'{prefix}{k}'] = val
+        elif k == 'SINI':
             cosi = jrandom.uniform(subkey, (num_samples,), minval=-1.0, maxval=1.0)
             theta[f'{prefix}cosi_{k}'] = cosi
             theta[f'{prefix}{k}'] = jnp.sqrt(jnp.clip(1.0 - cosi ** 2, 1e-12, 1.0))
@@ -456,6 +513,11 @@ def sample_timing_theta_batched(key, sample_list, theta_0, sigma, num_samples,
             z = jrandom.normal(subkey, (num_samples,)) * affine_z_sd
             theta[f'{prefix}z_{k}'] = z
             theta[f'{prefix}{k}'] = theta_0[k] + z * s
+
+    if override is not None:
+        for k, v in override.items():
+            theta[k] = jnp.broadcast_to(v, (num_samples, ))
+            
     return theta
 
 
@@ -484,6 +546,7 @@ def timing_init_values(sample_list, theta_0, prefix=''):
 
 def setup_timing_model(par_path: str, tim_path: str,
                        sample_list: list[str] | None = None,
+                       theta_0_overrides=None,
                        marginalise_list: list[str] | None = None,
                        *,
                        marginalise_all: bool = True,
@@ -500,6 +563,13 @@ def setup_timing_model(par_path: str, tim_path: str,
     par_path, tim_path : str
     sample_list : list[str], optional
         Params to sample nonlinearly.
+    theta_0_overrides : dict, optional
+        Manually override the par-file value of any parameter used as the
+        expansion point θ₀.  e.g. {'SINI': 0.99, 'M2': 0.25}.
+        Applied after theta_0_full is built from the par file, so it
+        overrides JUG's value without touching the session or par file.
+        Only affects θ₀ (the expansion point and prior centre) — JUG's
+        own fit, design matrix, and sigJUG are computed at the par values.
     marginalise_list : list[str], optional
         Params to marginalise linearly.  If given, ONLY these (plus OFFSET) are
         marginalised and every other non-sampled label is fixed.
@@ -816,6 +886,22 @@ def setup_timing_model(par_path: str, tim_path: str,
     # OMDOT is par-native.  These override any _read_param zero.
     theta_0_full['XDOT']  = XDOT_0
     theta_0_full['OMDOT'] = OMDOT_0
+
+    # ---- Apply manual θ₀ overrides ----------------------------------------
+    if theta_0_overrides:
+        for k, v in theta_0_overrides.items():
+            if k not in theta_0_full:
+                warnings.warn(
+                    f"theta_0_overrides: {k!r} not found in theta_0_full and "
+                    f"will be ignored.  Known keys: {sorted(theta_0_full)}",
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    f"theta_0 is being overridden.",
+                    stacklevel=2,
+                )
+                theta_0_full[k] = v
 
     sampled_names = set(sample_list)   # canonical, post-validation sample set
 
@@ -1780,7 +1866,8 @@ class MultiPsrTimingModel:
         return jnp.concatenate(parts)
 
     def sample_training_residuals(self, key, num_samples, pulsar_index,
-                                  z_scale=100.0, return_draws=False):
+                                  z_scale=100.0, affine_z_sd_bounded= 1, return_draws=False, perturb_bounded=False,
+                                 override = None):
         """Pure-JAX prior-predictive draws of ONE pulsar's timing-model delay.
 
         Draws ``num_samples`` parameter vectors from the same bounded priors as
@@ -1799,6 +1886,9 @@ class MultiPsrTimingModel:
             self.aux_list[pulsar_index]['sigJUG'],
             num_samples=num_samples,
             affine_z_sd=z_scale,
+            affine_z_sd_bounded = affine_z_sd_bounded,
+            perturb_bounded=perturb_bounded,
+            override = override
         )
         # Keep ONLY the physical param names: the batched sampler also returns
         # the 'z_*'/'cosi_*' sampler coordinates, and feeding those extra keys
@@ -1844,7 +1934,8 @@ class MultiPsrTimingModel:
 # ---------------------------------------------------------------------------
 
 def build_multi_psr_timing_model(parfiles, timfiles, sample_list, data,
-                                 load_how_many_in_parallel=1):
+                                 load_how_many_in_parallel=1,
+                                 theta_0_overrides=None):
     """Set up a MultiPsrTimingModel from par/tim file lists.
 
     Drop-in replacement for the unoptimised setup loop:
@@ -1870,6 +1961,10 @@ def build_multi_psr_timing_model(parfiles, timfiles, sample_list, data,
     -------
     model : MultiPsrTimingModel
     """
+    # Normalise so both branches can always zip over theta_0_overrides.
+    if theta_0_overrides is None:
+        theta_0_overrides = [None] * len(parfiles)
+
     npsr = len(parfiles)
     if len(timfiles) != npsr:
         raise ValueError(f"parfiles/timfiles length mismatch: {npsr} vs {len(timfiles)}")
@@ -1889,8 +1984,8 @@ def build_multi_psr_timing_model(parfiles, timfiles, sample_list, data,
         from tqdm_joblib import ParallelPbar
         from joblib import delayed
         results = ParallelPbar("Loading the par and tim files...")(n_jobs=njobs)(
-            delayed(setup_timing_model)(par, tim, sl)
-            for par, tim, sl in zip(parfiles, timfiles, sample_list)
+            delayed(setup_timing_model)(par, tim, sl, theta0)
+            for par, tim, sl, theta0 in zip(parfiles, timfiles, sample_list, theta_0_overrides)
         )
         # Plain unzip — np.array(..., dtype=object) on a list of
         # (callable, dict) pairs is shape-fragile and can raise or silently
@@ -1899,8 +1994,8 @@ def build_multi_psr_timing_model(parfiles, timfiles, sample_list, data,
         aux_list     = [r[1] for r in results]
     else:
         delta_m_list, aux_list = [], []
-        for par, tim, sl in zip(parfiles, timfiles, sample_list):
-            dm, a = setup_timing_model(par, tim, sl)
+        for par, tim, sl, theta0 in zip(parfiles, timfiles, sample_list, theta_0_overrides):
+            dm, a = setup_timing_model(par, tim, sl, theta0)
             delta_m_list.append(dm)
             aux_list.append(a)
 
