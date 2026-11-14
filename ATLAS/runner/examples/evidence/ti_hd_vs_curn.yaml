@@ -1,0 +1,86 @@
+# Thermodynamic integration (fixed-beta chains) on partial_marg_lnposterior:
+# ln Z for CURN and HD, then ln BF.
+#
+#   atlas-run check ti_hd_vs_curn.yaml
+#   atlas-run run   ti_hd_vs_curn.yaml                      # pass 1: 24 betas per model
+#   atlas-evidence estimate ti_hd_vs_curn.yaml              # ln Z +/- (sampling, discretisation)
+#   atlas-evidence propose  ti_hd_vs_curn.yaml --n 32       # pass 2: betas where sd(lnL) is large
+#   atlas-run run   ti_hd_vs_curn.yaml                      # runs only the new betas
+#   atlas-evidence bf ti_hd_vs_curn.yaml --a curn --b hd
+#
+# Each beta is an independent NUTS run of
+#   pi(theta) N(g; 0, phi_GWB) L_partial(r | g, theta)^beta
+# with every non-GWB coefficient marginalised; lnL_partial is saved per draw.
+config_version: 1
+
+vars:
+  base: /data/taylor_group/Nima
+  sim_dir: ${base}/Atlas/datasets/NG15/SIM
+  realization: 0
+
+ray:
+  num_cpus_per_run: 2
+  num_gpus_per_run: 0.25
+
+output:
+  root: ${base}/Evidence/TI_hd_vs_curn
+  skip_completed: true              # needed: 'propose' appends sweeps, rerun picks up the new ones
+
+data:
+  source: atlas_npz
+  npz_files: ${sim_dir}/${realization}_*.npz
+  noise_dict: ${base}/15yr_stochastic_analysis/tutorials/data/15yr_wn_dict.json
+  dm_ref_freq: 1400
+  cache_dir: ${base}/atlas_cache
+
+timing:
+  linear_timing: false
+  marg_timing: true
+
+white_noise:
+  vary: false
+  stabilize_TNT: false              # required for evidence
+
+frequency_bins:
+  num_irn_bins: 30
+  num_gwb_bins: 14
+  num_dm_bins: null
+  num_chrom_bins: null
+
+model:
+  basis_string: "unc+cor->unc"
+  priors_file: priors_ti.yaml
+  signals:
+    unc: {psd: powerlaw, priors: irn_wide}
+    cor:
+      psd: powerlaw
+      fixed: {gamma: 4.333333333333333}
+      orf: hd_orf
+      priors: gwb_amp_only
+
+sampler:
+  marg_over_non_gwb: true           # required: TI tempers partial_marg_lnposterior
+  beta: null                        # set per run by the sweeps
+  num_warmup: 500
+  num_samples: 2000
+  num_chains: 1
+  chain_method: vectorized
+  seed: 170817
+  nuts: {target_accept_prob: 0.8, max_tree_depth: 10}
+
+runs: []
+
+# Beta(0.3, 0.3) quantiles: dense at both ends, where E_beta[ln L] is steepest.
+# (python -c "from ATLAS.evidence import initial_betas; print(initial_betas(24))")
+sweeps:
+  - name: hd
+    grid:
+      sampler.beta: &betas [0.0, 0.000206, 0.002075, 0.007992, 0.020707, 0.043032, 0.077493,
+                            0.125917, 0.189006, 0.265995, 0.354492, 0.450608, 0.549392,
+                            0.645508, 0.734005, 0.810994, 0.874083, 0.922507, 0.956968,
+                            0.979293, 0.992008, 0.997925, 0.999794, 1.0]
+  - name: curn
+    base_overrides:
+      model.signals.cor.orf: zero_orf
+    grid:
+      sampler.beta: *betas

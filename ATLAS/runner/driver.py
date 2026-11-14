@@ -68,7 +68,7 @@ def prepare(runs):
         parsed = parse_basis_string(r["model"]["basis_string"])
         if "sw" in parsed["separate_names"]:
             gkey = (key, r["model"]["signals"]["sw"]["geometry"])
-            if gkey not in done:
+            if gkey not in done and gkey[1] != "stored":
                 data_io.sw_geometry(r, data_io.load_pulsars(
                     dict(r, data=dict(r["data"], pulsars="all", exclude=[]))))
                 done.add(gkey)
