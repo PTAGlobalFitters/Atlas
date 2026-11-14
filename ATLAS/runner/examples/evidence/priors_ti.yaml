@@ -1,0 +1,16 @@
+# Prior bounds for the Paper 2 runs (uniform [low, high]).
+
+irn_wide:                 # single-pulsar runs
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]
+
+irn_narrow:               # multi-pulsar runs: IRN pinned near zero
+  log10_A: [-20.0, -19.0]
+  gamma:   [1.0, 1.1]
+
+gwb_amp_only:             # gamma fixed at 13/3 in model.signals.cor.fixed
+  log10_A: [-18.0, -11.0]
+
+gwb_wide:                 # log10_A and gamma both sampled
+  log10_A: [-18.0, -11.0]
+  gamma:   [0.0, 7.0]

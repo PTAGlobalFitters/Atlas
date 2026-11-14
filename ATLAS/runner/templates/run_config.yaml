@@ -67,6 +67,12 @@ timing:
                              # | from_pulsar  (PulsarDataLoader.sample_params)
                              # | {file: info.npz, key: SAMPLE_LIST, index: 0}  -> {psr: [...]}
     parametrization: klam    # klam | simple (bounded per-parameter priors)
+  design_matrix:             # which RAW design-matrix columns the linear timing /
+                             # timing marginalisation uses (restricted before the SVD)
+    columns: all             # all | sampled | not_sampled | [F0, F1] | {psr: [...]}
+                             #   not_sampled + nonlinear: sample some params, marginalise the rest
+                             #   sampled (nonlinear off): STANDARD run on DIRECT's parameters
+    keep_offset: true
 
 white_noise:
   vary: false                # false = fixed at data.noise_dict
@@ -144,6 +150,9 @@ sampler:
   thinning: 1
   seed: 170817               # run i uses seed + i unless it overrides sampler.seed
   seed_offset_var: null      # or a variable name: seed + vars[name] (e.g. realization)
+  beta: null                 # thermodynamic integration: power on the partially marginalised
+                             #   likelihood (needs marg_over_non_gwb, a 'cor' block,
+                             #   stabilize_TNT false); sweep it and run atlas-evidence
   progress_bar: false
 
 runs:

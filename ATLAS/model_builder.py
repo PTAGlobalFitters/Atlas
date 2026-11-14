@@ -137,6 +137,8 @@ class ModelBuilder:
                        gwb_upper_bound_psd=None,
                        det_parameter_bounds=None,
                        gt_psd_val=None,
+                       gtm_lower_bound_psd=None,
+                       gtm_upper_bound_psd=None,
                        # ---- chromatic GP (`chrom`) ----
                        chrom_psd_function=None,
                        chrom_user_freqs = None,
@@ -234,7 +236,13 @@ class ModelBuilder:
         gt_psd_val : array, optional
             Fixed GTM phi, shape ``(adaptus_size, npsrs)``.  One value per
             basis column per pulsar.  When None the GTM PSD is held at unit
-            variance and no GTM parameters are sampled.
+            variance and no GTM parameters are sampled, unless the bounds
+            below are given.
+        gtm_lower_bound_psd, gtm_upper_bound_psd : float or array, optional
+            Free spectrum over the PCA columns: sample one ``halflog10_rho``
+            per basis column per pulsar, uniform in these bounds (a scalar or
+            one value per column).  Give both or neither; not together with
+            ``gt_psd_val``.
 
         Returns
         -------
@@ -257,6 +265,10 @@ class ModelBuilder:
                 user_freqs = irn_user_freqs,
             ))
 
+        if 'gtm' in red_signal_names and gt_psd_val is not None \
+                and gtm_lower_bound_psd is not None:
+            raise ValueError("gt_psd_val fixes the GTM PSD; gtm_lower/upper_bound_psd "
+                             "sample it -- give one or the other")
         if 'gtm' in red_signal_names:
             # `basis` and `gtm_psd` are both supplied here; GaussianTiming
             # uses `basis` for the column vectors and `gtm_psd` for a fixed
@@ -268,8 +280,8 @@ class ModelBuilder:
                 name='gtm',
                 nmodes=self.data.adaptus_size,
                 gtm_psd=gt_psd_val,
-                lower_bound_psd=None,
-                upper_bound_psd=None,
+                lower_bound_psd=gtm_lower_bound_psd,
+                upper_bound_psd=gtm_upper_bound_psd,
                 data=self.data,
                 basis=self.data.adaptus_basis,
             ))

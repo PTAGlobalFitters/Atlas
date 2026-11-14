@@ -78,6 +78,7 @@ DEFAULTS = {
         "marg_timing": True,
         "nonlinear": {"enabled": False, "params_to_sample": None,
                       "parametrization": "klam"},
+        "design_matrix": {"columns": "all", "keep_offset": True},
     },
     "white_noise": {"vary": False, "include_ecorr": "auto", "stabilize_TNT": False},
     "frequency_bins": {
@@ -101,7 +102,8 @@ DEFAULTS = {
                    "fixed_log10_sigma": None, "priors": "sw_ridge"},
             "gtm": {"basis_file": None, "basis_pattern": None, "mean_pattern": None,
                     "from_pulsar": False, "index": None, "size": None,
-                    "psd_file": None, "psd_value": None},
+                    "psd_file": None, "psd_value": None,
+                    "psd": "fixed", "priors": "gtm_free_spectrum"},
             "det": {"waveform": "cw_delay_evolve_float64", "priors": "cw"},
         },
     },
@@ -109,6 +111,10 @@ DEFAULTS = {
         "kind": "nuts",
         "model": "atlas",
         "seed_offset_var": None,
+        "beta": None,
+        "switch_overrides": None,
+        "dense_timing_mass": False,
+        "init_white_noise": None,
         "marg_over_non_gwb": False,
         "nuts": {"target_accept_prob": 0.8, "max_tree_depth": 10, "dense_mass": False},
         "num_warmup": 500,
@@ -122,7 +128,7 @@ DEFAULTS = {
 }
 
 # dicts whose keys are free-form (not checked against DEFAULTS)
-_FREE_FORM = ("vars", "ray.env_vars", "model.signals.*.fixed", "model.signals.sw.defaults",
+_FREE_FORM = ("vars", "sampler.switch_overrides", "timing.design_matrix.columns", "ray.env_vars", "model.signals.*.fixed", "model.signals.sw.defaults",
               "timing.nonlinear.params_to_sample")
 
 
@@ -470,6 +476,45 @@ def validate_run(run, check_files=True):
             errs.append("model.signals.dm.varied_index needs white_noise.vary or "
                         "timing.nonlinear.enabled (the helpers must be rebuilt per step)")
     custom = smp["model"] != "atlas"
+    if smp["beta"] is not None:
+        try:
+            b = float(smp["beta"])
+        except (TypeError, ValueError):
+            b = None
+        if b is None or not 0.0 <= b <= 1.0:
+            errs.append(f"sampler.beta must be a number in [0, 1], got {smp['beta']!r}")
+        if not smp["marg_over_non_gwb"]:
+            errs.append("sampler.beta (thermodynamic integration) needs "
+                        "sampler.marg_over_non_gwb: true (it tempers partial_marg_lnposterior)")
+        if "cor" not in present:
+            errs.append("sampler.beta needs a 'cor' block in basis_string")
+        if run["white_noise"]["stabilize_TNT"]:
+            errs.append("sampler.beta needs white_noise.stabilize_TNT: false "
+                        "(the stabilising shift biases ln Z)")
+        if custom:
+            errs.append("sampler.beta works with sampler.model: atlas only")
+    iwn = smp["init_white_noise"]
+    if iwn not in (None, "noise_dict"):
+        errs.append("sampler.init_white_noise must be null or noise_dict")
+    if iwn == "noise_dict" and not run["white_noise"]["vary"]:
+        errs.append("sampler.init_white_noise only matters with white_noise.vary: true")
+    if iwn == "noise_dict" and not run["data"]["noise_dict"]:
+        errs.append("sampler.init_white_noise: noise_dict needs data.noise_dict")
+    if smp["dense_timing_mass"] and not tm["nonlinear"]["enabled"]:
+        errs.append("sampler.dense_timing_mass needs timing.nonlinear.enabled "
+                    "(there are no sampled timing parameters otherwise)")
+    so = smp["switch_overrides"]
+    if so is not None:
+        if smp["beta"] is None:
+            errs.append("sampler.switch_overrides (model-switch TI) needs sampler.beta")
+        if not isinstance(so, dict) or not so:
+            errs.append("sampler.switch_overrides must be a non-empty {dotted.path: value} "
+                        "map that turns this run into model A (beta = 0)")
+        else:
+            bad = [k for k in so if not k.startswith("model.signals.")]
+            if bad:
+                errs.append(f"sampler.switch_overrides may only change model.signals.* "
+                            f"(same data, basis and white noise in both models); got {bad}")
     if custom and (not isinstance(smp["model"], str) or ":" not in smp["model"]):
         errs.append("sampler.model must be 'atlas' or 'path/to/file.py:function'")
     if sig["chrom"]["varied_index"] and not ({"chrom", "cquad"} & set(present)):
@@ -479,10 +524,26 @@ def validate_run(run, check_files=True):
     if tm["nonlinear"]["enabled"] and not run["data"]["par_files"]:
         errs.append("timing.nonlinear.enabled needs data.par_files / data.tim_files "
                     "(JUG reads them, whatever data.source is)")
+    cols = tm["design_matrix"]["columns"]
+    if not (cols in ("all", "sampled", "not_sampled") or isinstance(cols, (list, dict))):
+        errs.append("timing.design_matrix.columns must be all | sampled | not_sampled | "
+                    "[names] | {psr: [names]}")
+    if cols != "all" and not (tm["marg_timing"] or tm["linear_timing"]):
+        errs.append("timing.design_matrix.columns only matters with timing.marg_timing "
+                    "or timing.linear_timing (otherwise the design matrix is not used)")
+    if cols in ("sampled", "not_sampled") and not tm["nonlinear"]["enabled"] \
+            and tm["nonlinear"]["params_to_sample"] is None:
+        errs.append(f"timing.design_matrix.columns: {cols} takes its parameter list from "
+                    "timing.nonlinear.params_to_sample, which is not set (with nonlinear "
+                    "timing off there is no default list); add params_to_sample")
+    if tm["nonlinear"]["enabled"] and tm["marg_timing"] and cols in ("all", "sampled"):
+        errs.append("nonlinear timing with marg_timing: true would marginalise the sampled "
+                    "parameters' columns as well (double counting); set "
+                    "timing.design_matrix.columns: not_sampled")
     pts = tm["nonlinear"]["params_to_sample"]
     if not (pts is None or pts == "from_pulsar" or isinstance(pts, (list, dict))):
         errs.append("timing.nonlinear.params_to_sample must be null, 'from_pulsar', a list, "
-                    "{psr: [...]}, or {file: ..., key: ..., index: ...}")
+                    "{psr: [...]}, {exclude: [patterns]} or {file: ..., key: ..., index: ...}")
     for k in ("irn_user_freqs", "gwb_user_freqs", "dm_user_freqs", "chrom_user_freqs"):
         v = fb[k]
         if not (v is None or isinstance(v, (list, str, dict))):
@@ -523,6 +584,20 @@ def validate_run(run, check_files=True):
                 resolved[s].update(orf=ofn, orf_names=onames, orf_lower=olo, orf_upper=ohi)
         except (KeyError, ConfigError, ValueError) as exc:
             errs.append(f"signal {s!r}: {exc}")
+    if "gtm" in present and sig["gtm"]["psd"] == "free_spectrum":
+        try:
+            key = sig["gtm"]["priors"]
+            if key not in priors:
+                raise ConfigError(f"model.signals.gtm.priors = {key!r} is not a key of the "
+                                  "priors file")
+            entry = priors[key] or {}
+            pair = entry.get("halflog10_rho")
+            if not _is_pair(pair) or not float(pair[0]) < float(pair[1]):
+                raise ConfigError(f"priors[{key}] needs halflog10_rho: [low, high] "
+                                  "(one pair, used for every PCA column)")
+            resolved["gtm"] = dict(lower=float(pair[0]), upper=float(pair[1]))
+        except ConfigError as exc:
+            errs.append(f"signal 'gtm': {exc}")
     if "sw" in present and sig["sw"]["fixed_log10_sigma"] is None:
         try:
             if sig["sw"]["priors"] not in priors:
@@ -554,6 +629,14 @@ def validate_run(run, check_files=True):
                     "basis_pattern or from_pulsar")
     if g["psd_file"] and g["psd_value"] is not None:
         errs.append("model.signals.gtm: give psd_file or psd_value, not both")
+    if g["psd"] not in ("fixed", "free_spectrum"):
+        errs.append("model.signals.gtm.psd must be fixed or free_spectrum")
+    if "gtm" in present and g["psd"] == "free_spectrum":
+        if g["psd_file"] or g["psd_value"] is not None:
+            errs.append("model.signals.gtm: psd free_spectrum samples the variances; "
+                        "remove psd_file / psd_value")
+        if g["size"] is not None and isinstance(g["size"], int) and g["size"] % 2:
+            errs.append("model.signals.gtm.size must be even")
 
     # -- files --------------------------------------------------------------------
     if check_files:

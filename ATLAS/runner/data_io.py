@@ -24,7 +24,7 @@ log = logging.getLogger("ATLAS.runner")
 __all__ = ["data_key", "prepare_data", "load_pulsars", "pulsar_files",
            "sw_geometry", "sw_kwargs_for", "chrom_index_for", "load_noise_dict",
            "load_distances", "load_gtm", "sw_geometry_approx", "match_toas",
-           "user_freqs", "timing_params_for"]
+           "user_freqs", "timing_params_for", "restrict_design_matrix"]
 
 
 # --------------------------------------------------------------------------- #
@@ -349,13 +349,180 @@ def user_freqs(run, which):
     return None if v is None else np.asarray(v, float).reshape(-1)
 
 
+def _as_param_table(obj):
+    """``{psr: [params]}`` from a dict, or from dicts nested in any lists /
+    object arrays (e.g. ``[{'B1855+09': [...]}, {'B1937+21': [...]}]``, or
+    that list wrapped in an object array), merged."""
+    dicts = []
+
+    def walk(x, depth=0):
+        if depth > 6:
+            return
+        if isinstance(x, dict):
+            dicts.append(x)
+        elif isinstance(x, np.ndarray) and x.dtype == object:
+            for y in (x.reshape(-1) if x.ndim else [x.item()]):
+                walk(y, depth + 1)
+        elif isinstance(x, (list, tuple)):
+            for y in x:
+                walk(y, depth + 1)
+
+    walk(obj)
+    if not dicts:
+        raise ConfigError("params_to_sample: found no {psr: [params]} dict in the file entry "
+                          f"(got {type(obj).__name__}"
+                          + (f" with dtype {obj.dtype}, shape {obj.shape}" if hasattr(obj, "dtype") else "")
+                          + ")")
+    table = {}
+    for d in dicts:
+        for k, v in d.items():
+            if str(k) in table:
+                raise ConfigError(f"params_to_sample: {k} appears more than once in the file; "
+                                  "pick one entry with 'index'")
+            table[str(k)] = v
+    return table
+
+
+_LABEL_ALIAS = {"A1DOT": "XDOT", "E": "ECC", "PHOFF": "OFFSET"}
+
+
+def _canon(label):
+    u = str(label).upper()
+    return _LABEL_ALIAS.get(u, u)
+
+
+def _design(psr):
+    """(raw design matrix, its labels) of a PulsarDataLoader or enterprise Pulsar."""
+    labels = getattr(psr, "Mmat_labels", None)
+    if labels is None:
+        labels = list(getattr(psr, "fitpars"))
+    return np.asarray(psr.Mmat), [str(l) for l in labels]
+
+
+def _set_design(psr, M, labels):
+    cls_attr = getattr(type(psr), "Mmat", None)
+    if isinstance(cls_attr, property):                 # enterprise Pulsar
+        psr._designmatrix = M
+        if hasattr(psr, "_fitpars"):
+            psr._fitpars = np.asarray(labels)
+        return
+    old_lin = {}
+    if getattr(psr, "Mmat_is_linear", None) is not None:
+        old_lin = dict(zip(psr.Mmat_labels, np.asarray(psr.Mmat_is_linear, bool)))
+    psr.Mmat = M
+    psr.Mmat_labels = list(labels)
+    if getattr(psr, "Mmat_is_linear", None) is not None:
+        # an added offset column is linear; the rest keep their flags
+        lin = np.array([bool(old_lin.get(l, _canon(l) == "OFFSET")) for l in labels])
+        psr.Mmat_is_linear = lin
+        psr.Mmat_linear = M[:, lin]
+        psr.Mmat_linear_labels = [l for l, b in zip(labels, lin) if b]
+    if getattr(psr, "fit_param_names", None) is not None:
+        psr.fit_param_names = [l for l in labels if _canon(l) != "OFFSET"]
+
+
+def restrict_design_matrix(run, psrs, sampled=None):
+    """Keep only some columns of each pulsar's RAW design matrix, in place.
+
+    Applied before PTA_Data / WhiteCov are built, so both the linear-timing
+    basis and the timing marginalisation use the restricted matrix (each
+    takes its own SVD afterwards; the columns of the SVD basis no longer
+    correspond to parameters, so restricting after it is meaningless).
+
+    timing.design_matrix.columns:
+      all          leave M alone
+      sampled      the nonlinear sampled parameters (STANDARD run matching DIRECT)
+      not_sampled  every other fitted parameter (DIRECT: sample some nonlinearly,
+                   marginalise the rest linearly)
+      [names] / {psr: [names]}
+    plus the offset column when keep_offset (default).  Label matching is
+    case-insensitive and treats A1DOT=XDOT, E=ECC, PHOFF=OFFSET as the same.
+    Returns {psr: kept labels}.
+    """
+    spec = run["timing"]["design_matrix"]
+    cols, keep_offset = spec["columns"], bool(spec["keep_offset"])
+    names = [str(p.name) for p in psrs]
+    if cols == "all":
+        # every column stays; only make sure the constant offset is there
+        # (JUG-built .npz files have no offset column)
+        if not keep_offset:
+            return None
+        out = {}
+        for n, p in zip(names, psrs):
+            M, labels = _design(p)
+            nz = [j for j in range(M.shape[1]) if np.any(M[:, j])]
+            if len(nz) < M.shape[1]:
+                log.warning("%s: dropping %d all-zero design-matrix columns (no TOAs in "
+                            "their range): %s", n, M.shape[1] - len(nz),
+                            [labels[j] for j in range(M.shape[1]) if j not in nz])
+                M, labels = M[:, nz], [labels[j] for j in nz]
+                _set_design(p, M, labels)
+            if "OFFSET" not in [_canon(l) for l in labels]:
+                M = np.hstack([np.ones((M.shape[0], 1)), M])
+                labels = ["Offset"] + labels
+                _set_design(p, M, labels)
+                log.info("%s: design matrix had no offset column; added a constant one", n)
+            out[n] = labels
+        return out
+    if cols in ("sampled", "not_sampled") and sampled is None:
+        sampled = timing_params_for(run, psrs)
+    out, problems = {}, []
+    for i, (n, p) in enumerate(zip(names, psrs)):
+        M, labels = _design(p)
+        canon = [_canon(l) for l in labels]
+        fitted = [c for c in canon if c != "OFFSET"]
+        if cols == "sampled":
+            want = [_canon(x) for x in (sampled[i] if sampled is not None else fitted)]
+        elif cols == "not_sampled":
+            s = {_canon(x) for x in (sampled[i] if sampled is not None else fitted)}
+            want = [c for c in fitted if c not in s]
+        elif isinstance(cols, dict):
+            if n not in {str(k) for k in cols}:
+                problems.append(f"{n}: no entry in timing.design_matrix.columns")
+                continue
+            want = [_canon(x) for x in {str(k): v for k, v in cols.items()}[n]]
+        else:
+            want = [_canon(x) for x in cols]
+        missing = [w for w in want if w not in canon]
+        if missing:
+            problems.append(f"{n}: {missing} not among its design-matrix labels {labels}")
+            continue
+        sel = set(want) | ({"OFFSET"} if keep_offset else set())
+        if keep_offset and "OFFSET" not in canon:
+            # e.g. a JUG-built .npz: JUG handles the offset itself, so the
+            # stored design matrix has no constant column -- add one
+            M = np.hstack([np.ones((M.shape[0], 1)), M])
+            labels = ["Offset"] + labels
+            canon = ["OFFSET"] + canon
+            log.info("%s: design matrix had no offset column; added a constant one", n)
+        zero = [labels[j] for j in range(M.shape[1]) if not np.any(M[:, j])]
+        if zero:
+            log.warning("%s: dropping %d all-zero design-matrix columns (no TOAs in "
+                        "their range): %s", n, len(zero), zero)
+        idx = [j for j, c in enumerate(canon) if c in sel and np.any(M[:, j])]
+        if not idx:
+            problems.append(f"{n}: no design-matrix columns left")
+            continue
+        kept = [labels[j] for j in idx]
+        _set_design(p, M[:, idx], kept)
+        out[n] = kept
+        log.info("%s: design matrix restricted to %d of %d columns: %s",
+                 n, len(idx), len(labels), kept)
+    if problems:
+        raise ConfigError("timing.design_matrix:\n  " + "\n  ".join(problems))
+    return out
+
+
 def timing_params_for(run, psrs):
     """Per-pulsar list of timing parameters to sample nonlinearly, or None.
 
     ``params_to_sample`` may be null (every fitted parameter), a list (the
     same for every pulsar), ``{psr: [...]}``, ``from_pulsar``
     (PulsarDataLoader.sample_params), or ``{file: x.npz, key: K, index: i}``
-    whose object is ``{psr: [...]}`` (e.g. info.npz SAMPLE_LIST[0]).
+    whose object is ``{psr: [...]}`` or a list of one-pulsar dicts
+    (e.g. info.npz SAMPLE_LIST[0], or SAMPLE_LIST itself without ``index``).
+    With ``{psr}`` in ``file`` there is one file per pulsar, holding that
+    pulsar's list (an array of names, or a ``{psr: [...]}`` map).
     """
     spec = run["timing"]["nonlinear"]["params_to_sample"]
     names = [str(p.name) for p in psrs]
@@ -368,16 +535,60 @@ def timing_params_for(run, psrs):
         return [[str(x) for x in p.sample_params] for p in psrs]
     if isinstance(spec, list):
         return [[str(x) for x in spec] for _ in names]
+    if isinstance(spec, dict) and set(spec) <= {"exclude", "include"} and "file" not in spec:
+        # every fitted parameter (offset aside) except those matching the
+        # glob patterns in `exclude`, e.g. [DMX_*, FD*, JUMP*]; `include`
+        # (optional) keeps only matches
+        import fnmatch
+        exc = [str(x) for x in (spec.get("exclude") or [])]
+        inc = [str(x) for x in (spec.get("include") or [])]
+        out = []
+        for p in psrs:
+            M, labels = _design(p)
+            keep = []
+            for l, col in zip(labels, M.T):
+                if _canon(l) == "OFFSET" or not np.any(col):
+                    continue                     # offset, or a parameter with no effect
+                if exc and any(fnmatch.fnmatchcase(l.upper(), e.upper()) for e in exc):
+                    continue
+                if inc and not any(fnmatch.fnmatchcase(l.upper(), i.upper()) for i in inc):
+                    continue
+                keep.append("XDOT" if l.upper() == "A1DOT" else l)
+            out.append(keep)
+            log.info("%s: sampling %d timing parameters: %s", p.name, len(keep), keep)
+        return out
+    if isinstance(spec, dict) and "file" in spec and "{psr}" in str(spec["file"]):
+        # one file per pulsar: the array is that pulsar's list (or a {psr: list} map)
+        out, problems = [], []
+        for n in names:
+            one = dict(spec, file=str(spec["file"]).replace("{psr}", n))
+            try:
+                obj = _array_from_spec(run, one, "timing.nonlinear.params_to_sample")
+            except FileNotFoundError:
+                problems.append(f"{n}: {resolve_path(run, one['file'])} not found")
+                continue
+            if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 0:
+                obj = obj.item()
+            if isinstance(obj, dict):
+                if n not in {str(k) for k in obj}:
+                    problems.append(f"{n}: its file has no entry for {n}")
+                    continue
+                obj = {str(k): v for k, v in obj.items()}[n]
+            out.append([str(x) for x in np.asarray(obj).reshape(-1)])
+        if problems:
+            raise ConfigError("params_to_sample:\n  " + "\n  ".join(problems))
+        return out
     if isinstance(spec, dict) and "file" in spec:
         obj = _array_from_spec(run, spec, "timing.nonlinear.params_to_sample")
-        if isinstance(obj, np.ndarray) and obj.dtype == object and obj.ndim == 0:
-            obj = obj.item()
-        table = {str(k): v for k, v in dict(obj).items()}
+        table = _as_param_table(obj)
     else:
         table = {str(k): v for k, v in spec.items()}
     miss = [n for n in names if n not in table]
     if miss:
-        raise ConfigError(f"params_to_sample has no entry for {miss}")
+        hint = (" ('index' picked one element of the file entry; if it is a list of "
+                "one-pulsar dicts, remove 'index')"
+                if isinstance(spec, dict) and spec.get("index") is not None else "")
+        raise ConfigError(f"params_to_sample has no entry for {miss}{hint}")
     return [[str(x) for x in np.asarray(table[n]).reshape(-1)] for n in names]
 
 
@@ -457,6 +668,21 @@ def _sw_cache(run, method):
 def sw_geometry(run, psrs, compute=True):
     """Per-pulsar solar-wind geometry [pc] in each pulsar's TOA order (cached)."""
     method = run["model"]["signals"]["sw"]["geometry"]
+    if method == "stored":
+        # computed when the .npz was written (PulsarDataLoader.sw_geometry),
+        # already in the pulsar's TOA order; nothing to cache
+        out = []
+        for p in psrs:
+            g = getattr(p, "sw_geometry", None)
+            if g is None:
+                raise ConfigError(f"{p.name}: no sw_geometry stored in its .npz; "
+                                  "use model.signals.sw.geometry: pint or approx")
+            g = np.asarray(g, float).reshape(-1)
+            if g.size != len(p.toas):
+                raise ConfigError(f"{p.name}: stored sw_geometry has {g.size} entries "
+                                  f"for {len(p.toas)} TOAs")
+            out.append(g)
+        return out
     cache = _sw_cache(run, method)
     files = {}
     if run["data"]["par_files"] and method != "approx":

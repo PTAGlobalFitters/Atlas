@@ -1537,8 +1537,19 @@ class SuperSignal:
         else:
             return jit(partial(self.__lnposterior_reparam, D_params=None))
 
-    def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
+    def partial_marg_lnposterior(self, helpers, red_params, z, D_params=None,
+                                 beta=None, return_lnlike=False):
         """Public entry point — dispatches to the cached jitted implementation.
+
+        ``beta`` (thermodynamic integration) tempers the likelihood with the
+        non-GWB coefficients marginalised, L_partial(r | g, theta), leaving the
+        prior on the GWB coefficients untempered::
+
+            q_beta = pi(theta) N(g; 0, phi_G) L_partial^beta
+
+        ``beta=None`` is the ordinary posterior (beta = 1).  With
+        ``return_lnlike=True`` the result is ``(log_density, g, ln L_partial)``;
+        ``E_beta[ln L_partial]`` is the TI integrand.
 
         Requires a 'cor' block, unlike `lnposterior_reparam`. Checked here
         rather than in `partial_marg_lnposterior_helper`, which
@@ -1553,10 +1564,12 @@ class SuperSignal:
                 f"string {self.signal_combination_string!r} has none. Use "
                 "lnposterior_reparam instead."
             )
+        b = jnp.asarray(1.0 if beta is None else beta, dtype=jnp.float64)
         if self.has_det:
-            return self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params)
+            out = self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params, beta=b)
         else:
-            return self._jitted_partial_marg_lnposterior(helpers, red_params, z)
+            out = self._jitted_partial_marg_lnposterior(helpers, red_params, z, beta=b)
+        return out if return_lnlike else out[:2]
             
     def lnposterior_reparam(self, helpers, red_params, z, D_params=None):
         """Public entry point — dispatches to the cached jitted implementation.
@@ -1694,7 +1707,80 @@ class SuperSignal:
 
         return log_density, coeff[..., 0]
 
-    def __partial_marg_lnposterior(self, helpers, red_params, z, D_params=None):
+    def partial_marg_switch_lnposterior(self, helpers, red_params, z, beta, other):
+        """Model-switch thermodynamic integration between two GWB priors.
+
+        ``other`` is a SuperSignal for model A (beta = 0) built on the same
+        data, basis and parameter layout as this one (model B, beta = 1) --
+        e.g. CURN (``zero_orf``) against HD.  Every non-GWB coefficient is
+        marginalised as in ``partial_marg_lnposterior``; the data likelihood
+        is the same in both models and is NOT tempered.  Only the GWB prior
+        moves along the path::
+
+            q_beta = p(eta) L_partial(r | g, eta)
+                     N(g; 0, Phi_A)^(1 - beta) N(g; 0, Phi_B)^beta
+
+        Returns ``(log_density, g, delta)`` with
+        ``delta = ln N(g; 0, Phi_B) - ln N(g; 0, Phi_A)``;
+        ``ln BF_{B,A} = int_0^1 E_beta[delta] d beta``.
+        """
+        if self.has_det or other.has_det:
+            raise ValueError("model-switch TI does not support deterministic signals yet")
+        if self.signal_comb_idxs.get('cor') is None or other.signal_comb_idxs.get('cor') is None:
+            raise ValueError("model-switch TI needs a 'cor' block in both models")
+        if self.nmodes != other.nmodes or \
+                self.model.upper_prior_lim_all.shape != other.model.upper_prior_lim_all.shape:
+            raise ValueError("model-switch TI needs both models on the same basis and "
+                             "parameter layout (e.g. the same model with a different fixed ORF)")
+        cache = self.__dict__.setdefault('_switch_jits', {})
+        key = id(other)
+        if key not in cache:
+            cache[key] = jit(partial(self._partial_marg_switch, other_model=other.model))
+        return cache[key](helpers, red_params, z, jnp.asarray(beta, dtype=jnp.float64))
+
+    def _partial_marg_switch(self, helpers, red_params, z, beta, other_model):
+        TNT, TNr, rNr, logdet_N = helpers
+        cor_idx, P_idx, _ = self.partial_marg_lnposterior_helper
+        GG = TNT[:, *sutils.block_slice(cor_idx)]
+        PP = TNT[:, *sutils.block_slice(P_idx)]
+        GP = TNT[:, *sutils.block_slice(cor_idx, P_idx)]
+        Gr = TNr[:, sutils.vec_slice(cor_idx), None]
+        Pr = TNr[:, sutils.vec_slice(P_idx), None]
+
+        phiinv_B, logdet_B, phiinv_P, logdet_phi_P = self.model.partial_reparm_helper(red_params, self._pad_mask)
+        phiinv_A, logdet_A, _, _ = other_model.partial_reparm_helper(red_params, self._pad_mask)
+
+        dP = jnp.arange(PP.shape[-1])
+        Sigma_inv_P = PP.at[:, dP, dP].add(phiinv_P)
+        chol_P = jsl.cho_factor(Sigma_inv_P, lower=True)
+        Sigma_P = jsl.cho_solve(chol_P, jnp.broadcast_to(jnp.identity(PP.shape[-1]), PP.shape))
+        logdet_Sigma_inv_P = 2 * jnp.sum(jnp.log(jnp.diagonal(chol_P[0], axis1=-2, axis2=-1)))
+
+        U = 0.5 * Pr.mT @ Sigma_P @ Pr
+        V = -GP @ Sigma_P @ Pr + Gr
+        W = -GP @ Sigma_P @ GP.mT + GG
+
+        # whitening with the mixed prior precision (diagonal part, per pulsar)
+        dG = jnp.arange(W.shape[-1])
+        dA = jnp.diagonal(phiinv_A, axis1=1, axis2=2).T
+        dB = jnp.diagonal(phiinv_B, axis1=1, axis2=2).T
+        Psi = W.at[:, dG, dG].add((1.0 - beta) * dA + beta * dB)
+        L = jsl.cho_factor(Psi, lower=True)
+        g_hat = jsl.cho_solve(L, V)
+        g = g_hat + jax.lax.linalg.triangular_solve(L[0], z[..., None], left_side=True,
+                                                    lower=True, transpose_a=True)
+        lndet_Jac = -jnp.sum(jnp.log(L[0].diagonal(axis1=-2, axis2=-1)))
+
+        lnL_partial = -0.5 * (logdet_N + logdet_phi_P + logdet_Sigma_inv_P) \
+            + jnp.sum(U + g.mT @ V - 0.5 * g.mT @ W @ g) - 0.5 * rNr
+        gt, gp = g.transpose(1, 2, 0), g.transpose(1, 0, 2)
+        ln_prior_A = -0.5 * (gt @ phiinv_A @ gp).sum() - 0.5 * logdet_A
+        ln_prior_B = -0.5 * (gt @ phiinv_B @ gp).sum() - 0.5 * logdet_B
+        delta = ln_prior_B - ln_prior_A
+        result = lnL_partial + ln_prior_A + beta * delta + lndet_Jac
+        return result, g, delta
+
+    def __partial_marg_lnposterior(self, helpers, red_params, z, D_params=None, beta=1.0):
         """Log-posterior with the GWB coefficients kept and the rest marginalized.
 
         The non-GWB coefficients (timing, IRN, DM, GTM) are integrated out
@@ -1712,11 +1798,19 @@ class SuperSignal:
         D_params : tuple or None
             (det_params, psr_phases, psr_dists); required iff ``self.has_det``.
 
+        beta : float, default 1.0
+            Power on the likelihood with the non-GWB coefficients marginalised
+            (thermodynamic integration).  The GWB prior, the reparameterisation
+            Jacobian and the parameter priors are not tempered; ``g`` is
+            reparameterised with the tempered precision ``beta W + phi_G^-1``.
+
         Returns
         -------
         log_density : float
         g : array, [npsr, n_gwb_modes]
             The GWB coefficients implied by ``z``.
+        lnL_partial : float
+            ln L_partial(r | g, theta), the TI integrand.
         """
         # unpack helper objects
         TNT, TNr, rNr, logdet_N = helpers
@@ -1770,15 +1864,21 @@ class SuperSignal:
 
         W_inv_without_prior = -GP @ Sigma_P @ GP.mT + GG
 
-        # normalization
-        norm = -0.5 * (logdet_N + logdet_phi_G + logdet_phi_P + logdet_Sigma_inv_P)
+        # normalization, split into the part that belongs to the likelihood
+        # with P marginalised (tempered by beta) and the GWB prior (not)
+        norm_like = -0.5 * (logdet_N + logdet_phi_P + logdet_Sigma_inv_P)
+        norm_prior = -0.5 * logdet_phi_G
 
-        # standardizing transformation
+        # standardizing transformation, with the tempered precision
+        # beta * W + phi_G^-1 (beta = 1: the usual posterior precision), so the
+        # sampler sees a well-conditioned target at every beta.  The ORF
+        # correlations of phi_G^-1 enter through `lnprior` below; only its
+        # diagonal is used here, as before.
         diag_idxs_G = jnp.arange(W_inv_without_prior.shape[-1])
         phiinv_G_diag = jnp.diagonal(phiinv_G, axis1=1, axis2=2).T
-        W_inv_curn = W_inv_without_prior.at[:, diag_idxs_G, diag_idxs_G].add(phiinv_G_diag)
+        W_inv_curn = (beta * W_inv_without_prior).at[:, diag_idxs_G, diag_idxs_G].add(phiinv_G_diag)
         W_inv_curn_L = jsl.cho_factor(W_inv_curn, lower=True)
-        g_hat = jsl.cho_solve(W_inv_curn_L, V)
+        g_hat = jsl.cho_solve(W_inv_curn_L, beta * V)
         Lz = jax.lax.linalg.triangular_solve(W_inv_curn_L[0], z[..., None],
                                             left_side=True, lower=True, transpose_a=True)
         g = g_hat + Lz  # [npsr, nmodes, 1]
@@ -1788,5 +1888,6 @@ class SuperSignal:
         lnprior = -0.5 * (g.transpose(1, 2, 0) @ phiinv_G @ g.transpose(1, 0, 2)).sum()
 
         # `rNr` enters exactly once, here, outside the per-pulsar sum.
-        result = norm + lnprior + lndet_Jac + jnp.sum(ln_likelihood) - 0.5 * rNr
-        return result, g
+        lnL_partial = norm_like + jnp.sum(ln_likelihood) - 0.5 * rNr
+        result = norm_prior + lnprior + lndet_Jac + beta * lnL_partial
+        return result, g, lnL_partial
