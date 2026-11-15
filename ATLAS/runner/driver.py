@@ -103,7 +103,13 @@ def run(config_path, executor="ray", only=None, dry_run=False):
     prepare(todo)
 
     if executor == "local":
-        return skipped + [run_one(r) for r in todo]
+        import gc, jax
+        results = []
+        for r in todo:
+            results.append(run_one(r))
+            gc.collect()              # break the model's reference loops -> frees GPU buffers
+            jax.clear_caches()        # drop compiled functions that hold the old model
+        return skipped + results
     if executor != "ray":
         raise ValueError(f"executor must be 'ray' or 'local', got {executor!r}")
 
@@ -113,7 +119,7 @@ def run(config_path, executor="ray", only=None, dry_run=False):
         ray.init(address=r0["ray"]["address"], runtime_env=_ray_runtime_env(r0),
                  include_dashboard=False, ignore_reinit_error=True,
                  log_to_driver=True)
-    remote = ray.remote(_ray_entry)
+    remote = ray.remote(max_calls=1)(_ray_entry)   # was: ray.remote(_ray_entry)
     pending, results, name_of = [], [], {}
     limit = r0["ray"]["max_concurrent_runs"] or len(todo)
     queue = list(todo)
