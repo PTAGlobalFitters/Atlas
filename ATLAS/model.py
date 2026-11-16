@@ -37,6 +37,7 @@ def model_maker(raw_residuals,
                 static_helpers = None,
                 beta = None,
                 switch_super_sig = None,
+                gwb_prior_flow = None,
                 ):
     """NumPyro model for the ATLAS global fit.
 
@@ -146,6 +147,14 @@ def model_maker(raw_residuals,
         data likelihood is untempered; only the GWB prior moves from Phi_A
         to Phi_B.  Records ``delta_switch`` = ln N(g; Phi_B) - ln N(g; Phi_A);
         ln BF_{B,A} = int_0^1 E_beta[delta_switch] d beta.  Needs ``beta``.
+    gwb_prior_flow : ATLAS.experimental.flow_prior.FlowPrior, optional
+        Prior for the GWB spectrum parameters (e.g. the free-spectrum
+        ``halflog10_rho`` of every GWB bin) from a trained ``SASFlow``,
+        instead of the uniform box.  The flow density is truncated to the box
+        and renormalised, so evidences stay correct; it applies to whatever
+        model is sampled (both ends of a model-switch path share it).  The
+        added log density is recorded as the deterministic site
+        ``gwb_prior_lnpdf``.
 
     Notes
     -----
@@ -298,6 +307,16 @@ def model_maker(raw_residuals,
         'red_noise',
         dist.Uniform(super_sig.model.lower_prior_lim_all,
                      super_sig.model.upper_prior_lim_all))
+    if gwb_prior_flow is not None:
+        # replace the uniform density of the GWB block by the flow prior
+        from ATLAS.experimental.flow_prior import gwb_param_slice
+        g0, g1 = gwb_param_slice(super_sig.model)
+        if g1 - g0 != gwb_prior_flow.D:
+            raise ValueError(f"gwb_prior_flow models {gwb_prior_flow.D} parameters but the "
+                             f"GWB block of red_noise has {g1 - g0}")
+        lnpi_g = gwb_prior_flow.log_density(xs[g0:g1])
+        numpyro.deterministic('gwb_prior_lnpdf', lnpi_g)
+        numpyro.factor('gwb_prior_flow', lnpi_g + gwb_prior_flow.log_volume)
 
     # ------------------------------------------------------------------ #
     #  Deterministic signals                                                #

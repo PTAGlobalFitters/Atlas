@@ -14,3 +14,6 @@ gwb_amp_only:             # gamma fixed at 13/3 in model.signals.cor.fixed
 gwb_wide:                 # log10_A and gamma both sampled
   log10_A: [-18.0, -11.0]
   gamma:   [0.0, 7.0]
+
+gwb_free_spectrum_wide:   # one pair, used for every GWB bin; also the box a prior flow is truncated to
+  halflog10_rho: [-10.0, -4.0]
