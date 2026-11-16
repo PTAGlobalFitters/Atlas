@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -51,11 +53,14 @@ def _cmd_check(a):
 def _cmd_run(a):
     from ATLAS.runner.config import ConfigError
     from ATLAS.runner.driver import run
+    executor = "inline" if a.in_process else ("local" if a.local else "ray")
     try:
-        results = run(a.config, executor="local" if a.local else "ray", only=a.only)
+        results = run(a.config, executor=executor, only=a.only)
     except ConfigError as exc:
         print(f"CONFIG ERROR\n{exc}")
         return 2
+    if a.result_json:                      # child of a --local run: hand the results back
+        Path(a.result_json).write_text(json.dumps(results, default=str))
     failed = [r for r in results if r.get("state") == "failed"]
     for r in results:
         line = f"{r.get('run_name')}: {r.get('state')}"
@@ -89,10 +94,20 @@ def main(argv=None):
         s.add_argument("--only", nargs="+", help="run only these run names")
         if name == "run":
             s.add_argument("--local", action="store_true",
-                           help="run sequentially in this process instead of Ray")
+                           help="run sequentially without Ray, each run in a fresh process")
+            s.add_argument("--in-process", action="store_true",
+                           help="with --local: run everything inside this one process "
+                                "(GPU memory is not returned between runs)")
+            s.add_argument("--result-json", help=argparse.SUPPRESS)
         s.set_defaults(fn=fn)
     s = sub.add_parser("status"); s.add_argument("config"); s.set_defaults(fn=_cmd_status)
     a = p.parse_args(argv)
+    if a.cmd == "run" and not a.in_process:
+        # The coordinating process only plans and launches; keep it off the GPU so
+        # the runs (Ray workers or --local child processes) get the whole device.
+        # The original setting is restored in each run (driver._run_env).
+        os.environ.setdefault("ATLAS_RUN_JAX_PLATFORMS", os.environ.get("JAX_PLATFORMS", ""))
+        os.environ["JAX_PLATFORMS"] = "cpu"
     logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     logging.getLogger("ATLAS.runner").setLevel(logging.INFO)

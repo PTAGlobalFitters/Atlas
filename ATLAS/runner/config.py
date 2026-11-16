@@ -92,7 +92,11 @@ DEFAULTS = {
         "priors_file": None,
         "signals": {
             "unc": {"psd": "powerlaw", "fixed": {}, "priors": "irn_powerlaw"},
-            "cor": {"psd": "powerlaw", "fixed": {}, "orf": "hd_orf", "priors": "gwb_powerlaw_free_gamma"},
+            "cor": {"psd": "powerlaw", "fixed": {}, "orf": "hd_orf", "priors": "gwb_powerlaw_free_gamma",
+                    # GWB spectrum prior from a trained SASFlow (replaces the uniform box):
+                    # {file: flow.npz, flow_num_layers: 4, hidden_size: 128,
+                    #  mlp_num_layers: 2, num_bins: 8, B: 5.0, mass_samples: 200000}
+                    "prior_flow": None},
             "dm": {"psd": "powerlaw", "fixed": {}, "priors": "dm_powerlaw", "varied_index": False},
             "chrom": {"psd": "powerlaw", "fixed": {}, "priors": "chrom_powerlaw", "chrom_index": 4.0,
                       "varied_index": False, "index_bounds": [0.0, 7.0]},
@@ -129,6 +133,7 @@ DEFAULTS = {
 
 # dicts whose keys are free-form (not checked against DEFAULTS)
 _FREE_FORM = ("vars", "sampler.switch_overrides", "timing.design_matrix.columns", "ray.env_vars", "model.signals.*.fixed", "model.signals.sw.defaults",
+              "model.signals.cor.prior_flow",
               "timing.nonlinear.params_to_sample")
 
 
@@ -622,6 +627,19 @@ def validate_run(run, check_files=True):
             errs.append(f"signal 'det': {exc}")
         if run["data"]["pulsar_distances"] is None:
             errs.append("a 'det' signal needs data.pulsar_distances")
+    pf = sig["cor"].get("prior_flow")
+    if pf is not None:
+        allowed = {"file", "flow_num_layers", "hidden_size", "mlp_num_layers", "num_bins", "B",
+                   "mass_samples"}
+        if not isinstance(pf, dict) or "file" not in pf:
+            errs.append("model.signals.cor.prior_flow must be null or {file: flow.npz, ...}")
+        elif set(pf) - allowed:
+            errs.append(f"model.signals.cor.prior_flow: unknown keys {sorted(set(pf) - allowed)}; "
+                        f"expected {sorted(allowed)}")
+        elif "cor" not in present:
+            errs.append("model.signals.cor.prior_flow needs a 'cor' block in the basis string")
+        elif check_files and not Path(_resolve(run, pf["file"])).exists():
+            errs.append(f"model.signals.cor.prior_flow.file not found: {pf['file']}")
     g = sig["gtm"]
     n_src = sum(bool(x) for x in (g["basis_file"], g["basis_pattern"], g["from_pulsar"]))
     if "gtm" in present and n_src != 1:

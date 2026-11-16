@@ -106,6 +106,8 @@ def _model_and_args(run, b):
         args["beta"] = jnp.asarray(float(smp["beta"]))
     if smp["switch_overrides"]:
         bound["switch_super_sig"] = _switch_model(run).rn
+    if sig["cor"].get("prior_flow"):
+        bound["gwb_prior_flow"] = _gwb_prior_flow(run, b)
     basis_moves = chrom_idx or dm_idx or vary_white or b.tm_model is not None
     if vary_white:
         args.update(wn_lower_bound=b.wn_lower, wn_upper_bound=b.wn_upper)
@@ -126,6 +128,20 @@ def _model_and_args(run, b):
     if basis_moves:
         args["red_noise_basis"] = b.rn.get_Fmat_concat
     return partial(model_maker, **bound), args
+
+
+def _gwb_prior_flow(run, b):
+    """FlowPrior for the GWB spectrum parameters (model.signals.cor.prior_flow)."""
+    from ATLAS.experimental.flow_prior import FlowPrior, gwb_param_slice
+    from ATLAS.runner.config import _resolve
+    spec = dict(run["model"]["signals"]["cor"]["prior_flow"])
+    path = _resolve(run, spec.pop("file"))
+    g0, g1 = gwb_param_slice(b.rn.model)
+    lo = np.asarray(b.rn.model.lower_prior_lim_all)[g0:g1]
+    hi = np.asarray(b.rn.model.upper_prior_lim_all)[g0:g1]
+    prior = FlowPrior.load(path, lo, hi, **spec)
+    log.info("GWB prior from flow %s: %r", path, prior)
+    return prior
 
 
 def _switch_model(run):
