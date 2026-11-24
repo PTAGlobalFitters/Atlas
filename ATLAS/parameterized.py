@@ -1535,6 +1535,10 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
         self.I = jnp.repeat(a[None, :], crn_bins, axis=0)
         self.J = jnp.repeat(b[None, :], crn_bins, axis=0)
         self.KGW = jnp.repeat(self.GWB_fidxs[:, None], len(a), axis=1)
+        # Rows of a GWB-only array (crn_bins, Np, Np): positions within the GWB
+        # block, unlike KGW, whose absolute bins index the full red-noise grid.
+        # The two agree only when 'cor' starts at bin 0 (nested in 'unc').
+        self.KGW_local = jnp.repeat(jnp.arange(crn_bins)[:, None], len(a), axis=1)
 
         if has_irn and self.separate_inversion_strat:
             self.DIR = jnp.repeat(self.diag_idx[None, :],
@@ -2211,10 +2215,13 @@ class CorrelatedPulsarRedNoise(_GTMModeMixin, _ExtraBlocksMixin):
                 jnp.repeat(self._eval_extra_psd(blk, xs), 2, axis=0))
             _x0 += 2 * blk.bins
 
+        # phi_gwb holds only the GWB bins, so its rows are indexed locally
+        # (KGW_local). The absolute KGW would point past its end whenever 'cor'
+        # is a separate basis block, and JAX drops out-of-range scatters.
         phi_gwb = jnp.zeros((self.crn_bins, self.Npulsars, self.Npulsars))
         phi_gwb = phi_gwb.at[:, self.diag_idx, self.diag_idx].set(psd_common)
-        phi_gwb = phi_gwb.at[self.KGW, self.I, self.J].set(orf_val * psd_common)
-        phi_gwb = phi_gwb.at[self.KGW, self.J, self.I].set(orf_val * psd_common)
+        phi_gwb = phi_gwb.at[self.KGW_local, self.I, self.J].set(orf_val * psd_common)
+        phi_gwb = phi_gwb.at[self.KGW_local, self.J, self.I].set(orf_val * psd_common)
 
         # per-pulsar phi (already at mode resolution)
         phiinv_non_gwb = 1 / phi_diag_non_gwb

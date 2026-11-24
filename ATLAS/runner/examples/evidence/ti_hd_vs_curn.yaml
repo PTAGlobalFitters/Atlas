@@ -1,0 +1,83 @@
+# Model-switch TI, HD vs CURN, with a GWB free spectrum whose prior comes from a
+# trained normalizing flow (ATLAS.experimental.flows.SASFlow) instead of a uniform box.
+#
+# Train and save the flow on the GWB free-spectrum parameters only, one column per
+# GWB bin (lowest frequency first), e.g. from an earlier free-spectrum posterior:
+#     flow = SASFlow(samples_halflog10_rho, flow_num_layers=4, hidden_size=128, num_bins=8)
+#     flow.fit(...); flow.save_params("gwb_flow.npz")
+# The architecture below must match the one used for training.  The flow density is
+# truncated to the halflog10_rho box of the priors file and renormalised, so evidences
+# stay correct (in a model-switch run both models share it, so it cancels).
+config_version: 1
+
+vars:
+  base: /data/taylor_group/Nima
+  sim_dir: ${base}/Atlas/datasets/NG15/ATLAS_pulsar
+
+ray:
+  num_cpus_per_run: 2
+  num_gpus_per_run: 0.25
+
+output:
+  root: ${base}/Evidence/TI_switch_hd_vs_curn_flow_prior
+  skip_completed: true
+
+data:
+  source: atlas_npz
+  npz_files: ${sim_dir}/*.npz
+  noise_dict: ${base}/15yr_stochastic_analysis/tutorials/data/15yr_wn_dict.json
+  dm_ref_freq: 1400
+  cache_dir: ${base}/atlas_cache
+
+timing:
+  linear_timing: false
+  marg_timing: true
+
+white_noise:
+  vary: false
+  stabilize_TNT: false
+
+frequency_bins:
+  num_irn_bins: 30
+  num_gwb_bins: 14
+  num_dm_bins: null
+  num_chrom_bins: null
+
+model:
+  basis_string: "unc+cor->unc"
+  priors_file: priors_ti.yaml
+  signals:
+    unc: {psd: powerlaw, priors: irn_wide}
+    cor:
+      psd: gwb_free_spectrum
+      orf: hd_orf                    # model B (beta = 1)
+      priors: gwb_free_spectrum_wide # box the flow is truncated to
+      prior_flow:
+        file: ${base}/flows/gwb_flow.npz
+        flow_num_layers: 4
+        hidden_size: 128
+        mlp_num_layers: 2
+        num_bins: 8
+        B: 5.0
+        mass_samples: 200000         # flow draws used for the mass inside the box
+
+sampler:
+  marg_over_non_gwb: true
+  beta: null
+  switch_overrides:                  # model A (beta = 0): only model.signals.* may change
+    model.signals.cor.orf: zero_orf
+  num_warmup: 500
+  num_samples: 4000
+  num_chains: 1
+  chain_method: vectorized
+  seed: 170817
+  nuts: {target_accept_prob: 0.8, max_tree_depth: 10}
+
+runs: []
+
+# The switch integrand is smooth; an even grid is a good start.
+sweeps:
+  - name: hd_vs_curn
+    grid:
+      sampler.beta: [0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5,
+                     0.5625, 0.625, 0.6875, 0.75, 0.8125, 0.875, 0.9375, 1.0]

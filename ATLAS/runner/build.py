@@ -72,6 +72,18 @@ def build_model(run, parsed, resolved):
 
     psrs = data_io.load_pulsars(run)
     names = [str(p.name) for p in psrs]
+    tm_params = None
+    if tm_cfg["nonlinear"]["enabled"] or tm_cfg["design_matrix"]["columns"] in ("sampled", "not_sampled"):
+        tm_params = data_io.timing_params_for(run, psrs)
+        if tm_params is None and tm_cfg["nonlinear"]["enabled"]:
+            # every fitted parameter, read BEFORE the design matrix is
+            # restricted (make_timing_model would otherwise read the
+            # restricted labels)
+            tm_params = [[("XDOT" if l.upper() == "A1DOT" else l)
+                          for l in data_io._design(p)[1] if data_io._canon(l) != "OFFSET"]
+                         for p in psrs]
+    # before PTA_Data / WhiteCov: both take their own SVD of psr.Mmat
+    data_io.restrict_design_matrix(run, psrs, sampled=tm_params)
     noise_dict = data_io.load_noise_dict(run)
 
     adaptus_basis = gtm_psd = gtm_means = None
@@ -151,7 +163,10 @@ def build_model(run, parsed, resolved):
         kw["det_delay_function"] = registry.waveform(sig["det"]["waveform"])
         kw["det_parameter_bounds"] = np.stack([resolved["det"]["lower"],
                                                resolved["det"]["upper"]], axis=1)
-    if "gtm" in present and gtm_psd is not None:
+    if "gtm" in present and sig["gtm"]["psd"] == "free_spectrum":
+        kw["gtm_lower_bound_psd"] = resolved["gtm"]["lower"]
+        kw["gtm_upper_bound_psd"] = resolved["gtm"]["upper"]
+    elif "gtm" in present and gtm_psd is not None:
         kw["gt_psd_val"] = jnp.asarray(gtm_psd)
 
     rn = mb.make_red_noise(run["model"]["basis_string"], **kw)
@@ -159,7 +174,7 @@ def build_model(run, parsed, resolved):
     tm_model = None
     if tm_cfg["nonlinear"]["enabled"]:
         tm_model = mb.make_timing_model(
-            explicit_timing_model_params_to_sample=data_io.timing_params_for(run, psrs))
+            explicit_timing_model_params_to_sample=tm_params)
 
     log.info("built %s: %d pulsars, %d T-matrix columns, %d red-noise parameters",
              run["run"]["name"], len(psrs), rn.nmodes, rn.model.upper_prior_lim_all.shape[0])

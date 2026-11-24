@@ -8,8 +8,10 @@ A run that fails while sampling only fails itself; the rest carry on.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 from ATLAS.runner import data_io
@@ -68,7 +70,7 @@ def prepare(runs):
         parsed = parse_basis_string(r["model"]["basis_string"])
         if "sw" in parsed["separate_names"]:
             gkey = (key, r["model"]["signals"]["sw"]["geometry"])
-            if gkey not in done:
+            if gkey not in done and gkey[1] != "stored":
                 data_io.sw_geometry(r, data_io.load_pulsars(
                     dict(r, data=dict(r["data"], pulsars="all", exclude=[]))))
                 done.add(gkey)
@@ -76,6 +78,9 @@ def prepare(runs):
 
 def _ray_runtime_env(run0):
     env = {k: str(v) for k, v in (run0["ray"]["env_vars"] or {}).items()}
+    if "JAX_PLATFORMS" not in env and "ATLAS_RUN_JAX_PLATFORMS" in os.environ:
+        # atlas-run pinned the driver to the CPU; give the workers the original setting
+        env["JAX_PLATFORMS"] = os.environ["ATLAS_RUN_JAX_PLATFORMS"]
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (_ATLAS_ROOT, os.environ.get("PYTHONPATH", "")) if p)
     return {"env_vars": env}
@@ -87,10 +92,44 @@ def _ray_entry(run):
     return run_one(run)
 
 
+def _run_env():
+    """Environment for a run: the JAX platform setting the user started with
+    (atlas-run pins its own coordinating process to the CPU)."""
+    env = dict(os.environ)
+    orig = env.pop("ATLAS_RUN_JAX_PLATFORMS", None)
+    if orig is not None:
+        if orig:
+            env["JAX_PLATFORMS"] = orig
+        else:
+            env.pop("JAX_PLATFORMS", None)
+    return env
+
+
+def _run_in_child(config_path, r):
+    """Run one run in a fresh Python process (``atlas-run run --in-process``)."""
+    import subprocess, tempfile
+    name = r["run"]["name"]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "result.json"
+        cmd = [sys.executable, "-m", "ATLAS.runner.cli", "run", str(config_path), "--local",
+               "--in-process", "--only", name, "--result-json", str(out)]
+        log.info("%s: starting in a fresh process", name)
+        proc = subprocess.run(cmd, env=_run_env())
+        if out.exists():
+            res = [x for x in json.loads(out.read_text()) if x.get("run_name") == name]
+            if res:
+                return res[0]
+    return dict(run_name=name, state="failed",
+                error=f"run process exited with code {proc.returncode} without a result "
+                      "(killed, e.g. out of host memory?)")
+
+
 def run(config_path, executor="ray", only=None, dry_run=False):
     """Validate, prepare and execute every run.  Returns a list of status dicts.
 
-    ``executor="local"`` runs sequentially in this process (debugging, tests).
+    ``executor="local"`` runs sequentially without Ray, each run in a fresh
+    process; ``"inline"`` runs everything in this process (debugging, tests;
+    GPU memory may not be fully returned between runs).
     """
     plan = plan_runs(config_path, only=only)
     for r, action in plan:
@@ -102,10 +141,20 @@ def run(config_path, executor="ray", only=None, dry_run=False):
 
     prepare(todo)
 
+    if executor == "inline":
+        import gc, jax
+        results = []
+        for r in todo:
+            results.append(run_one(r))
+            gc.collect()              # break the model's reference loops -> frees GPU buffers
+            jax.clear_caches()        # drop compiled functions that hold the old model
+        return skipped + results
     if executor == "local":
-        return skipped + [run_one(r) for r in todo]
+        # one fresh process per run: all of its GPU memory is returned when it
+        # exits, whatever still referenced the old model
+        return skipped + [_run_in_child(config_path, r) for r in todo]
     if executor != "ray":
-        raise ValueError(f"executor must be 'ray' or 'local', got {executor!r}")
+        raise ValueError(f"executor must be 'ray', 'local' or 'inline', got {executor!r}")
 
     import ray
     r0 = todo[0]
@@ -113,7 +162,7 @@ def run(config_path, executor="ray", only=None, dry_run=False):
         ray.init(address=r0["ray"]["address"], runtime_env=_ray_runtime_env(r0),
                  include_dashboard=False, ignore_reinit_error=True,
                  log_to_driver=True)
-    remote = ray.remote(_ray_entry)
+    remote = ray.remote(max_calls=1)(_ray_entry)   # was: ray.remote(_ray_entry)
     pending, results, name_of = [], [], {}
     limit = r0["ray"]["max_concurrent_runs"] or len(todo)
     queue = list(todo)

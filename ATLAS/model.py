@@ -35,6 +35,9 @@ def model_maker(raw_residuals,
                 varied_chrom_gp_index = False,
                 chrom_gp_index_bounds = (0.0, 7.0),
                 static_helpers = None,
+                beta = None,
+                switch_super_sig = None,
+                gwb_prior_flow = None,
                 ):
     """NumPyro model for the ATLAS global fit.
 
@@ -129,6 +132,30 @@ def model_maker(raw_residuals,
         T^T N^-1 T.  Only valid while the basis and white noise are fixed, so
         it cannot be combined with ``vary_white`` or a sampled index.
 
+    beta : float or array, optional
+        Thermodynamic integration: sample the power posterior
+        ``pi(theta) N(g; 0, phi_G) L_partial(r | g, theta)^beta`` where
+        ``L_partial`` is the likelihood with every non-GWB coefficient
+        marginalised.  Needs ``marg_over_non_gwb=True`` (a ``cor`` block) and
+        a super_sig built without ``stabilize_TNT``.  Records the TI
+        integrand as the deterministic site ``lnL_partial``.  ``None`` (the
+        default) is the ordinary posterior and records nothing extra.
+    switch_super_sig : SuperSignal, optional
+        Model-switch thermodynamic integration: ``switch_super_sig`` is
+        model A (beta = 0), ``super_sig`` model B (beta = 1), same data,
+        basis and parameters, different GWB prior (e.g. CURN vs HD).  The
+        data likelihood is untempered; only the GWB prior moves from Phi_A
+        to Phi_B.  Records ``delta_switch`` = ln N(g; Phi_B) - ln N(g; Phi_A);
+        ln BF_{B,A} = int_0^1 E_beta[delta_switch] d beta.  Needs ``beta``.
+    gwb_prior_flow : ATLAS.experimental.flow_prior.FlowPrior, optional
+        Prior for the GWB spectrum parameters (e.g. the free-spectrum
+        ``halflog10_rho`` of every GWB bin) from a trained ``SASFlow``,
+        instead of the uniform box.  The flow density is truncated to the box
+        and renormalised, so evidences stay correct; it applies to whatever
+        model is sampled (both ends of a model-switch path share it).  The
+        added log density is recorded as the deterministic site
+        ``gwb_prior_lnpdf``.
+
     Notes
     -----
     The ``numpyro.factor`` cancellation:
@@ -145,6 +172,19 @@ def model_maker(raw_residuals,
         If ``varied_chrom_index=True`` without a ``dm`` block, or with
         pre-built helpers that would ignore the sampled index.
     """
+    if switch_super_sig is not None and beta is None:
+        raise ValueError("switch_super_sig (model-switch TI) needs beta")
+    if beta is not None:
+        if not marg_over_non_gwb:
+            raise ValueError("beta (thermodynamic integration) uses partial_marg_lnposterior: "
+                             "set marg_over_non_gwb=True.")
+        if super_sig.signal_comb_idxs.get('cor') is None:
+            raise ValueError("beta (thermodynamic integration) needs a 'cor' block; "
+                             "partial_marg_lnposterior keeps the GWB coefficients.")
+        if getattr(getattr(super_sig.data, "Nmat", None), "stabilize", False):
+            raise ValueError("beta (thermodynamic integration) needs stabilize_TNT=False: "
+                             "the stabilising shift of TNT depends on the model and "
+                             "biases ln Z.")
     # Fixed white noise, fixed residuals, but a sampled chromatic-GP index:
     # the helpers are rebuilt each draw from the fixed white-noise values.
     rebuild_fixed_wn = (varied_chrom_gp_index and not vary_white
@@ -267,6 +307,16 @@ def model_maker(raw_residuals,
         'red_noise',
         dist.Uniform(super_sig.model.lower_prior_lim_all,
                      super_sig.model.upper_prior_lim_all))
+    if gwb_prior_flow is not None:
+        # replace the uniform density of the GWB block by the flow prior
+        from ATLAS.experimental.flow_prior import gwb_param_slice
+        g0, g1 = gwb_param_slice(super_sig.model)
+        if g1 - g0 != gwb_prior_flow.D:
+            raise ValueError(f"gwb_prior_flow models {gwb_prior_flow.D} parameters but the "
+                             f"GWB block of red_noise has {g1 - g0}")
+        lnpi_g = gwb_prior_flow.log_density(xs[g0:g1])
+        numpyro.deterministic('gwb_prior_lnpdf', lnpi_g)
+        numpyro.factor('gwb_prior_flow', lnpi_g + gwb_prior_flow.log_volume)
 
     # ------------------------------------------------------------------ #
     #  Deterministic signals                                                #
@@ -306,8 +356,18 @@ def model_maker(raw_residuals,
         z_a = numpyro.sample(
             'z_a',
             dist.Normal(0, 1).expand((super_sig.npsrs, n_gwb_modes)))
-        lprob, coeff = super_sig.partial_marg_lnposterior(
-            helpers=helpers_now, red_params=xs, z=z_a, D_params=D_params)
+        if beta is None:
+            lprob, coeff = super_sig.partial_marg_lnposterior(
+                helpers=helpers_now, red_params=xs, z=z_a, D_params=D_params)
+        elif switch_super_sig is not None:
+            lprob, coeff, delta = super_sig.partial_marg_switch_lnposterior(
+                helpers_now, xs, z_a, beta, switch_super_sig)
+            numpyro.deterministic('delta_switch', delta)
+        else:
+            lprob, coeff, lnL_partial = super_sig.partial_marg_lnposterior(
+                helpers=helpers_now, red_params=xs, z=z_a, D_params=D_params,
+                beta=beta, return_lnlike=True)
+            numpyro.deterministic('lnL_partial', lnL_partial)
     else:
         n_reparam = super_sig.nmodes - (
             super_sig.det_signal.num_coeff_det if super_sig.has_det else 0)
