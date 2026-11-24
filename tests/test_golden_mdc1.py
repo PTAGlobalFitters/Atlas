@@ -13,8 +13,10 @@ Regenerate the record with ``python tools/golden_mdc1.py``.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -115,10 +117,18 @@ def test_config_is_pinned(record):
 @pytest.mark.slow
 @pytest.mark.gpu
 def test_golden_run_reproduces():
-    """Re-run the fit and compare against the record. Minutes, and a GPU."""
+    """Re-run the fit and compare against the record. Minutes on a GPU; the
+    tool falls back to CPU, with a warning, when none is available."""
+    env = dict(os.environ)
+    if env.pop("ATLAS_TEST_CPU_DEFAULT", None):
+        # conftest pins the in-process suite to CPU; the fit should use the GPU.
+        env.pop("JAX_PLATFORMS", None)
     r = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "golden_mdc1.py"), "--check"],
-        cwd=ROOT, capture_output=True, text=True)
+        cwd=ROOT, capture_output=True, text=True, env=env)
+    for line in r.stderr.splitlines():
+        if line.startswith("golden_mdc1: WARNING:"):
+            warnings.warn(line.split("WARNING:", 1)[1].strip())
     assert r.returncode == 0, r.stdout + r.stderr
     shifts = [float(line.split("shift")[1].split("MC")[0])
               for line in r.stdout.splitlines() if "shift" in line]

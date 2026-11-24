@@ -173,12 +173,26 @@ def run():
     return summary
 
 
+def warn_if_no_gpu():
+    """Fall back to CPU, loudly. The fit still runs, but takes far longer
+    (over 30 min on a many-core CPU against ~4 min on a 4090)."""
+    backend = jax.default_backend()
+    if backend == "gpu":
+        return
+    requested = os.environ.get("JAX_PLATFORMS")
+    why = (f"JAX_PLATFORMS={requested!r} is set" if requested
+           else "no GPU is available to JAX")
+    print(f"golden_mdc1: WARNING: {why}; running the golden fit on {backend}, "
+          f"which is much slower than on a GPU.", file=sys.stderr, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="compare against the record instead of rewriting it")
     args = ap.parse_args()
 
+    warn_if_no_gpu()
     summary = run()
     p = summary["posterior"]
     h = summary["health"]

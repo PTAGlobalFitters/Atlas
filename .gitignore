@@ -214,3 +214,4 @@ notebooks/single_psr/
 
 # Large pulsar pickles produced by the demo notebooks
 notebooks/*.pkl
+/bench/results

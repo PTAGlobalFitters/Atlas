@@ -15,6 +15,7 @@ if not jax.config.read('jax_enable_x64'):
     # a GPU machine every process that imports ATLAS (e.g. the atlas-run
     # driver) would then reserve most of each visible GPU's memory.
     jax.config.update('jax_enable_x64', True)
+
     if jax.config.read('jax_enable_x64'):
         print("JAX 64-bit mode automatically enabled successfully.")
     else:
