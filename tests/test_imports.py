@@ -97,7 +97,9 @@ def test_astro_imports_without_its_extra():
 
 def test_flax_flows_import_without_torch():
     """The JAX flows need flax, optax and distrax but not torch or zuko."""
-    r = _import_with_blocked(("torch", "zuko"), mods=["ATLAS.experimental.flax_flows"])
+    for mod in ("flax", "optax", "distrax"):
+        pytest.importorskip(mod)
+    r =_import_with_blocked(("torch", "zuko"), mods=["ATLAS.experimental.flax_flows"])
     assert r.returncode == 0, f"{r.stdout}\n{r.stderr[-2000:]}"
 
 
