@@ -20,6 +20,8 @@ constants cancel.
 Usage
 -----
     from ATLAS.experimental.flow_prior import FlowPrior
+    prior = FlowPrior.load("gwb_flow.pkl", lower, upper)      # flow.save / fit(save_path=...)
+    # or, from SASFlow.save_params (the architecture must be given):
     prior = FlowPrior.load("gwb_flow.npz", lower, upper,
                            flow_num_layers=4, hidden_size=128, num_bins=8)
     model_maker(..., gwb_prior_flow=prior)
@@ -101,13 +103,24 @@ class FlowPrior:
     @classmethod
     def load(cls, path, lower, upper, flow_num_layers=4, hidden_size=128,
              mlp_num_layers=2, num_bins=8, B=5.0, mass_samples=200_000, seed=0):
-        """Rebuild a saved unconditional ``SASFlow`` and wrap it.
+        """Load a saved unconditional ``SASFlow`` and wrap it.
 
-        The architecture arguments must match those the flow was trained
-        with (they are not stored in the file); the weights and the SAS data
-        normalizer are read from ``path`` (``SASFlow.save_params``).
+        A pickle (``flow.save`` or ``fit(save_path=...)``) holds the whole
+        flow, so the architecture arguments are ignored.  For an ``.npz`` file
+        (``SASFlow.save_params``) they must match those the flow was trained
+        with; the weights, SAS normalizer and whitener are read from ``path``.
         """
-        from ATLAS.experimental.flows import SASFlow
+        from ATLAS.experimental.flows import SASFlow, load_flow
+
+        if not str(path).endswith(".npz"):
+            flow = load_flow(path)
+            if not isinstance(flow, SASFlow):
+                raise TypeError(f"{path} holds a {type(flow).__name__}; the GWB prior needs an "
+                                "unconditional SASFlow trained on the GWB parameters only")
+            if flow.P:
+                raise ValueError(f"{path}: this is a joint flow p(theta, x); the GWB prior needs "
+                                 "an unconditional SASFlow trained on the GWB parameters only")
+            return cls(flow, lower, upper, mass_samples=mass_samples, seed=seed)
 
         D = np.asarray(lower).size
         with np.load(path) as f:
